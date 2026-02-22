@@ -101,6 +101,12 @@ This is my running engineering diary for Jet so we do not lose feature intent, c
 	- `running` when worker starts execution.
 	- `completed` with full `JobResult` payload when evaluation succeeds.
 	- `failed` with error message when evaluation fails.
+- Added API polling tests using embedded `mini-redis`:
+	- found job id -> `200 OK` with decoded job state.
+	- missing job id -> `404 NOT_FOUND`.
+- Hardened worker runtime checks before sandbox execution:
+	- validates manifest has runtime archive entry for normalized host architecture.
+	- validates installed runtime root exists at `<runtime_install_dir>/<language>/<version>/root`.
 - Main server startup now runs both:
 	- HTTP API listener.
 	- Background worker loop.

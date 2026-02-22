@@ -52,35 +52,9 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
     )
     .await?;
 
-    let key = format!("{}:{}", job.language, job.version);
-    let manifest = data
-        .manifests
-        .get(&key)
-        .cloned()
-        .ok_or_else(|| std::io::Error::other("manifest missing"))?;
-
-    let workspace_dir = data.runtime_install_dir.join("jobs").join(&job.id);
-    fs::create_dir_all(&workspace_dir)
-        .await
-        .map_err(|source| std::io::Error::other(source.to_string()))?;
-
-    let runtime_dir = data.runtime_install_dir.join(&job.language).join(&job.version);
-    let runtime_opt = runtime_dir.exists().then_some(runtime_dir);
-
-    let mut limits = ExecutionLimits::default();
-    if let Some(memory) = job.request.run_memory_limit {
-        limits.memory_limit_bytes = memory;
-    }
-    if let Some(timeout) = job.request.run_timeout {
-        limits.timeout_ms = timeout;
-    }
-    if let Some(output_limit) = job.request.run_output_limit {
-        limits.output_limit_bytes = output_limit;
-    }
-
-    let evaluator = Evaluator::new(workspace_dir, runtime_opt, manifest, limits);
-    let result = match evaluator.evaluate(&job.request) {
-        Ok(result) => {
+    let result = process_job(&job, &data).await;
+    match result {
+        Ok(job_result) => {
             write_job_state(
                 &data.redis_conn,
                 &data.job_state_prefix,
@@ -89,12 +63,11 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     status: "completed".to_string(),
                     language: job.language.clone(),
                     version: job.version.clone(),
-                    result: Some(result.clone()),
+                    result: Some(job_result.clone()),
                     error: None,
                 },
             )
             .await?;
-            result
         }
         Err(source) => {
             write_job_state(
@@ -110,21 +83,86 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                 },
             )
             .await?;
-            return Err(std::io::Error::other(source.to_string()));
+            return Err(source);
         }
-    };
-
-    println!(
-        "job {} completed: language={} version={} compile_status={:?} run_status={:?}",
-        job.id,
-        result.language,
-        result.version,
-        result.compile.as_ref().map(|r| &r.status),
-        result.run.as_ref().map(|r| &r.status)
-    );
+    }
 
     Ok(())
 }
+
+async fn process_job(
+    job: &QueuedJob,
+    data: &WorkerContext,
+) -> Result<jet_core::models::JobResult, std::io::Error> {
+    let key = format!("{}:{}", job.language, job.version);
+    let manifest = data
+        .manifests
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("manifest missing"))?;
+
+    let host_arch = normalize_arch(std::env::consts::ARCH);
+    if !manifest.runtimes.contains_key(host_arch) {
+        return Err(std::io::Error::other(format!(
+            "runtime archive for architecture '{}' is missing in manifest",
+            host_arch
+        )));
+    }
+
+    let runtime_root_dir = data
+        .runtime_install_dir
+        .join(&job.language)
+        .join(&job.version)
+        .join("root");
+    if !runtime_root_dir.exists() {
+        return Err(std::io::Error::other(format!(
+            "runtime is not installed at {}",
+            runtime_root_dir.display()
+        )));
+    }
+
+    let workspace_dir = data.runtime_install_dir.join("jobs").join(&job.id);
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .map_err(|source| std::io::Error::other(source.to_string()))?;
+
+    let mut limits = ExecutionLimits::default();
+    if let Some(memory) = job.request.run_memory_limit {
+        limits.memory_limit_bytes = memory;
+    }
+    if let Some(timeout) = job.request.run_timeout {
+        limits.timeout_ms = timeout;
+    }
+    if let Some(output_limit) = job.request.run_output_limit {
+        limits.output_limit_bytes = output_limit;
+    }
+
+    let evaluator = Evaluator::new(workspace_dir, Some(runtime_root_dir), manifest, limits);
+    evaluator
+        .evaluate(&job.request)
+        .map_err(|source| std::io::Error::other(source.to_string()))
+}
+
+fn normalize_arch(arch: &str) -> &str {
+    match arch {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        _ => arch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_arch;
+
+    #[test]
+    fn normalizes_common_arch_aliases() {
+        assert_eq!(normalize_arch("amd64"), "x86_64");
+        assert_eq!(normalize_arch("arm64"), "aarch64");
+        assert_eq!(normalize_arch("x86_64"), "x86_64");
+    }
+}
+
 
 async fn write_job_state(
     redis_conn: &Arc<Mutex<ConnectionManager>>,
