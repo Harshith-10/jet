@@ -44,9 +44,8 @@ impl RuntimeUpdater for JavaCorrettoUpdater {
         let mut updated = Vec::new();
 
         for major in &self.majors {
-            let url = format!(
-                "https://api.github.com/repos/corretto/corretto-{major}/releases/latest"
-            );
+            let url =
+                format!("https://api.github.com/repos/corretto/corretto-{major}/releases/latest");
             let release_json = github_get_json(&url)?;
             let manifest = parse_corretto_release_manifest(major, &release_json)?;
 
@@ -103,15 +102,19 @@ fn github_get_json(url: &str) -> JetPackResult<Value> {
     })
 }
 
-pub fn parse_corretto_release_manifest(major: &str, release: &Value) -> JetPackResult<RuntimeManifest> {
+pub fn parse_corretto_release_manifest(
+    major: &str,
+    release: &Value,
+) -> JetPackResult<RuntimeManifest> {
     let tag_name = release
         .get("tag_name")
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    let version_regex = Regex::new(r"(\d+\.[\d.]+)").map_err(|error| JetPackError::Serialization {
-        message: error.to_string(),
-    })?;
+    let version_regex =
+        Regex::new(r"(\d+\.[\d.]+)").map_err(|error| JetPackError::Serialization {
+            message: error.to_string(),
+        })?;
 
     let Some(version_capture) = version_regex.captures(tag_name) else {
         return Err(JetPackError::InvalidVersion {
@@ -156,16 +159,10 @@ pub fn parse_corretto_release_manifest(major: &str, release: &Value) -> JetPackR
 
     let mut runtimes = HashMap::new();
     if let Some(url) = x86_64_url {
-        runtimes.insert(
-            "x86_64".to_string(),
-            RuntimeArchive { url, sha256: None },
-        );
+        runtimes.insert("x86_64".to_string(), RuntimeArchive { url, sha256: None });
     }
     if let Some(url) = aarch64_url {
-        runtimes.insert(
-            "aarch64".to_string(),
-            RuntimeArchive { url, sha256: None },
-        );
+        runtimes.insert("aarch64".to_string(), RuntimeArchive { url, sha256: None });
     }
 
     if !runtimes.contains_key("x86_64") || !runtimes.contains_key("aarch64") {
@@ -179,14 +176,18 @@ pub fn parse_corretto_release_manifest(major: &str, release: &Value) -> JetPackR
     Ok(RuntimeManifest {
         language: "java".to_string(),
         version: full_version.clone(),
-        aliases: vec![format!("java{major}"), format!("jdk{major}")],
+        aliases: vec![
+            major.to_string(),
+            format!("java{major}"),
+            format!("jdk{major}"),
+        ],
         runtimes,
         compile: Some(ExecutionTemplate {
-            command: format!("/opt/java/{major}/{full_version}/bin/javac"),
+            command: "/opt/runtime/bin/javac".to_string(),
             args: Some(vec!["{file}".to_string()]),
         }),
         execute: ExecutionTemplate {
-            command: format!("/opt/java/{major}/{full_version}/bin/java"),
+            command: "/opt/runtime/bin/java".to_string(),
             args: Some(vec!["-cp".to_string(), ".".to_string(), "Main".to_string()]),
         },
     })
@@ -224,7 +225,10 @@ pub fn parse_python_release_manifests(release: &Value) -> JetPackResult<Vec<Upda
             continue;
         };
 
-        let version = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let version = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         let arch_suffix = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
         let arch_key = match arch_suffix {
             "x86_64_v3" => "x86_64",
@@ -290,11 +294,19 @@ pub fn parse_python_release_manifests(release: &Value) -> JetPackResult<Vec<Upda
         let manifest = RuntimeManifest {
             language: "python".to_string(),
             version: version.clone(),
-            aliases: vec!["python3".to_string(), "py".to_string()],
+            aliases: vec![
+                format!(
+                    "{}.{}",
+                    parse_python_version(version)?.major,
+                    parse_python_version(version)?.minor
+                ),
+                "python3".to_string(),
+                "py".to_string(),
+            ],
             runtimes,
             compile: None,
             execute: ExecutionTemplate {
-                command: format!("/opt/python/{version}/python/bin/python3"),
+                command: "/opt/runtime/bin/python3".to_string(),
                 args: Some(vec!["{file}".to_string()]),
             },
         };
@@ -446,10 +458,19 @@ mod tests {
             ]
         });
 
-        let manifests = parse_python_release_manifests(&release).expect("python manifests should parse");
+        let manifests =
+            parse_python_release_manifests(&release).expect("python manifests should parse");
 
         assert_eq!(manifests.len(), 2);
-        assert!(manifests.iter().any(|m| m.file_name == "python-3.14.3.yaml"));
-        assert!(manifests.iter().any(|m| m.file_name == "python-3.15.0a6.yaml"));
+        assert!(
+            manifests
+                .iter()
+                .any(|m| m.file_name == "python-3.14.3.yaml")
+        );
+        assert!(
+            manifests
+                .iter()
+                .any(|m| m.file_name == "python-3.15.0a6.yaml")
+        );
     }
 }

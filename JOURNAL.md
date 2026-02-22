@@ -117,3 +117,46 @@ This is my running engineering diary for Jet so we do not lose feature intent, c
 ### Phase 4 Next Steps
 - Improve worker runtime path resolution with architecture/runtime checks before execute.
 - Add API integration tests for submit + poll flow (requires controllable Redis in test harness).
+
+### Phase 5 Update (Latest)
+- Implemented full `jet-cli` command surface with real operational commands:
+	- `exec` for single job submission + polling + console result/metrics output.
+	- `benchmark` for load simulation (`concurrency`, total `requests`, inter-request `delay`) with throughput/latency summary.
+	- `runtimes` admin commands (`list`, `install`, `update`).
+	- `server` utility commands (`run`, `generate-systemd`).
+- Added flexible flags for execution and benchmarking:
+	- language + version selection.
+	- multiple source files (`-f`).
+	- stdin file (`--stdin`).
+	- run/compile timeout, memory, and output limits.
+	- polling interval/timeout and server URL override.
+- Added CLI-side HTTP flow for:
+	- `POST /jobs` submission.
+	- `GET /jobs/:id` polling until terminal state.
+	- terminal rendering of compile/run/testcase metrics.
+- Added CLI unit tests for duration parsing, source parsing, request building, and benchmark percentile math.
+- Validation:
+	- `cargo test -p jet-cli` passes.
+	- Full workspace `cargo test` passes.
+
+### Phase 5 Follow-up (Runtime Resolution + Install Semantics)
+- Added loose-version resolution in `jet-pack` so runtime versions like Java `21.0.10.7.1` and Python prerelease tags can be indexed and resolved from short fragments.
+- Added Java major replacement behavior in installer path:
+	- installing a new Java full version now removes older installed versions in the same major line.
+	- reinstall of same full version replaces existing directory contents.
+- Added alias expansion in updater output so short Java fragments (for example `21`) resolve to canonical full versions.
+- Fixed evaluator placeholder substitution for compile/execute args (`{file}`) to prevent malformed argument vectors.
+- Added runtime install layout normalization in `jet-pack`:
+	- if extracted archive has a single wrapper directory (e.g. `amazon-corretto-*` or `python/`), it gets flattened into `.../root`.
+	- this makes runtime commands stable under `/opt/runtime/bin/...` inside sandbox.
+- Updated Python updater execution template to target `/opt/runtime/bin/python3` in normalized layout.
+- Switched evaluator runtime execution to `SandboxProfile::portable()` for now to avoid strict-policy breakage for installed runtime internals.
+
+### E2E Logging Artifact
+- Captured full manifest/update/install/exec validation log in project root:
+	- `e2e-runtime-log.txt`
+- Verified from log:
+	- short version resolution works (`21` -> `21.0.10.7.1`, `3.13` -> `3.13.12`).
+	- only one Java `21.*` runtime directory remains after install/reinstall.
+	- Python end-to-end execution succeeds in sandbox.
+	- Java still fails at VM initialization under current sandbox memory/capability profile (next tuning item).

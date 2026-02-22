@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     archive::extract_archive,
@@ -40,7 +43,11 @@ impl PackageManager {
         Ok(resolver)
     }
 
-    pub fn install_runtime(&self, manifest: &RuntimeManifest, arch: &str) -> JetPackResult<PathBuf> {
+    pub fn install_runtime(
+        &self,
+        manifest: &RuntimeManifest,
+        arch: &str,
+    ) -> JetPackResult<PathBuf> {
         let archive = manifest
             .runtimes
             .get(arch)
@@ -55,10 +62,21 @@ impl PackageManager {
             source,
         })?;
 
+        if manifest.language == "java" {
+            remove_old_java_major_installs(&self.runtime_dir, &manifest.version)?;
+        }
+
         let target_dir = self
             .runtime_dir
             .join(&manifest.language)
             .join(&manifest.version);
+
+        if target_dir.exists() {
+            fs::remove_dir_all(&target_dir).map_err(|source| JetPackError::Io {
+                path: target_dir.clone(),
+                source,
+            })?;
+        }
 
         fs::create_dir_all(&target_dir).map_err(|source| JetPackError::Io {
             path: target_dir.clone(),
@@ -77,6 +95,7 @@ impl PackageManager {
 
         let extracted_path = target_dir.join("root");
         extract_archive(&archive_path, &extracted_path)?;
+        flatten_single_top_level_dir(&extracted_path)?;
 
         Ok(extracted_path)
     }
@@ -125,6 +144,115 @@ impl PackageManager {
 
         Ok(paths)
     }
+}
+
+fn remove_old_java_major_installs(
+    runtime_dir: &PathBuf,
+    incoming_version: &str,
+) -> JetPackResult<()> {
+    let major = incoming_version
+        .split('.')
+        .next()
+        .ok_or_else(|| JetPackError::InvalidVersion {
+            value: incoming_version.to_string(),
+        })?;
+
+    let java_dir = runtime_dir.join("java");
+    if !java_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&java_dir).map_err(|source| JetPackError::Io {
+        path: java_dir.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| JetPackError::Io {
+            path: java_dir.clone(),
+            source,
+        })?;
+
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(version) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if version == incoming_version {
+            continue;
+        }
+
+        if version.split('.').next() == Some(major) {
+            fs::remove_dir_all(&path).map_err(|source| JetPackError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn flatten_single_top_level_dir(extracted_path: &Path) -> JetPackResult<()> {
+    let entries = fs::read_dir(extracted_path).map_err(|source| JetPackError::Io {
+        path: extracted_path.to_path_buf(),
+        source,
+    })?;
+
+    let mut child_dirs = Vec::new();
+    let mut non_dirs = 0usize;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| JetPackError::Io {
+            path: extracted_path.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            child_dirs.push(path);
+        } else {
+            non_dirs += 1;
+        }
+    }
+
+    if child_dirs.len() != 1 || non_dirs != 0 {
+        return Ok(());
+    }
+
+    let single_dir = child_dirs.pop().expect("single root child exists");
+    let single_name = single_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if matches!(
+        single_name,
+        "bin" | "lib" | "include" | "share" | "etc" | "usr"
+    ) {
+        return Ok(());
+    }
+    let nested_entries = fs::read_dir(&single_dir).map_err(|source| JetPackError::Io {
+        path: single_dir.clone(),
+        source,
+    })?;
+
+    for nested in nested_entries {
+        let nested = nested.map_err(|source| JetPackError::Io {
+            path: single_dir.clone(),
+            source,
+        })?;
+        let from = nested.path();
+        let to = extracted_path.join(nested.file_name());
+        fs::rename(&from, &to).map_err(|source| JetPackError::Io { path: from, source })?;
+    }
+
+    fs::remove_dir(&single_dir).map_err(|source| JetPackError::Io {
+        path: single_dir,
+        source,
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -224,7 +352,8 @@ mod tests {
     #[test]
     fn install_fails_for_missing_arch() {
         let dir = tempdir().expect("temp dir should exist");
-        let manager = PackageManager::new(dir.path().join("runtimes"), dir.path().join("manifests"));
+        let manager =
+            PackageManager::new(dir.path().join("runtimes"), dir.path().join("manifests"));
         let manifest = build_manifest("file:///tmp/does-not-matter.tar.gz".to_string());
 
         let err = manager.install_runtime(&manifest, "arm64");
@@ -241,7 +370,8 @@ mod tests {
         )
         .expect("manifest source should be written");
 
-        let manager = PackageManager::new(dir.path().join("runtimes"), dir.path().join("manifests"));
+        let manager =
+            PackageManager::new(dir.path().join("runtimes"), dir.path().join("manifests"));
 
         let updated = manager
             .update_manifests(&[ManifestSource {
@@ -257,7 +387,8 @@ mod tests {
     #[test]
     fn updates_manifests_from_runtime_updater_output() {
         let dir = tempdir().expect("temp dir should exist");
-        let manager = PackageManager::new(dir.path().join("runtimes"), dir.path().join("manifests"));
+        let manager =
+            PackageManager::new(dir.path().join("runtimes"), dir.path().join("manifests"));
 
         let written = manager
             .update_manifests_with_updater(&FakeUpdater)
@@ -265,5 +396,19 @@ mod tests {
 
         assert_eq!(written.len(), 1);
         assert!(written[0].exists());
+    }
+
+    #[test]
+    fn java_install_removes_old_major_versions() {
+        let dir = tempdir().expect("temp dir should exist");
+        let java_base = dir.path().join("runtimes").join("java");
+        fs::create_dir_all(java_base.join("21.0.9.10.1")).expect("old version dir");
+        fs::create_dir_all(java_base.join("17.0.18.9.1")).expect("different major dir");
+
+        remove_old_java_major_installs(&dir.path().join("runtimes"), "21.0.10.7.1")
+            .expect("prune should pass");
+
+        assert!(!java_base.join("21.0.9.10.1").exists());
+        assert!(java_base.join("17.0.18.9.1").exists());
     }
 }

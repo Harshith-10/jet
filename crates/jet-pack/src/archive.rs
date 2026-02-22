@@ -39,10 +39,12 @@ fn extract_tar_gz(archive_path: &Path, destination: &Path) -> JetPackResult<()> 
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
 
-    archive.unpack(destination).map_err(|source| JetPackError::Io {
-        path: destination.to_path_buf(),
-        source,
-    })?;
+    archive
+        .unpack(destination)
+        .map_err(|source| JetPackError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
 
     Ok(())
 }
@@ -142,7 +144,10 @@ mod tests {
         fs::write(&archive, "binary-data").expect("file should be written");
 
         let result = extract_archive(&archive, &dir.path().join("out"));
-        assert!(matches!(result, Err(JetPackError::UnsupportedArchive { .. })));
+        assert!(matches!(
+            result,
+            Err(JetPackError::UnsupportedArchive { .. })
+        ));
     }
 
     #[test]

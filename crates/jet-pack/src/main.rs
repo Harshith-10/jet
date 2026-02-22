@@ -56,7 +56,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_update(language: UpdateTarget, manager: &PackageManager) -> Result<usize, jet_pack::JetPackError> {
+fn run_update(
+    language: UpdateTarget,
+    manager: &PackageManager,
+) -> Result<usize, jet_pack::JetPackError> {
     match language {
         UpdateTarget::Java => manager
             .update_manifests_with_updater(&JavaCorrettoUpdater::default())

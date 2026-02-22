@@ -84,7 +84,8 @@ impl Sandbox {
             .setrlimit(Rlimit::As, limits.memory_limit_bytes, limits.memory_limit_bytes)
             .setrlimit(Rlimit::Core, 0, 0)
             .setrlimit(Rlimit::Fsize, limits.output_limit_bytes, limits.output_limit_bytes)
-            .setrlimit(Rlimit::Nofile, limits.file_limit, limits.file_limit);
+            .setrlimit(Rlimit::Nofile, limits.file_limit, limits.file_limit)
+            .setrlimit(Rlimit::Nproc, limits.pid_limit, limits.pid_limit);
 
         if profile.enable_cgroups {
             let mut resources = Resources::default();

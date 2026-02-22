@@ -62,8 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "jet-server startup complete: loaded {} manifest(s), version map cached at key '{}'",
-        manifest_count,
-        config.runtime_cache_key
+        manifest_count, config.runtime_cache_key
     );
     println!("server running on {addr}");
 

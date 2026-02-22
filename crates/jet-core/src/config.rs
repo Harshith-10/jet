@@ -236,8 +236,14 @@ mod tests {
         assert_eq!(config.server_host, "0.0.0.0");
         assert_eq!(config.server_port, 4000);
         assert_eq!(config.redis_url, "redis://cache:6379");
-        assert_eq!(config.runtime_install_dir, PathBuf::from("/opt/jet/runtimes"));
-        assert_eq!(config.runtimes_manifest_dir, PathBuf::from("/opt/jet/runtimes/manifests"));
+        assert_eq!(
+            config.runtime_install_dir,
+            PathBuf::from("/opt/jet/runtimes")
+        );
+        assert_eq!(
+            config.runtimes_manifest_dir,
+            PathBuf::from("/opt/jet/runtimes/manifests")
+        );
         assert_eq!(config.runtime_cache_key, "jet:test:version_map");
     }
 

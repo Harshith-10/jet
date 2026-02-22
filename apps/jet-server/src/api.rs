@@ -41,7 +41,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/jobs", post(submit_job))
-    .route("/jobs/:id", get(get_job))
+        .route("/jobs/{id}", get(get_job))
         .with_state(state)
 }
 
@@ -163,7 +163,10 @@ mod tests {
     use axum::{extract::Path, extract::State, http::StatusCode};
     use mini_redis::server;
     use redis::AsyncCommands;
-    use tokio::{net::TcpListener, sync::{Mutex, oneshot}};
+    use tokio::{
+        net::TcpListener,
+        sync::{Mutex, oneshot},
+    };
 
     use super::{ApiState, get_job};
     use crate::queue::{JobStateRecord, QueuedJob, job_state_key};
@@ -190,9 +193,7 @@ mod tests {
         let queue_conn = apalis_redis::connect(redis_url.clone())
             .await
             .expect("queue conn");
-        let status_conn = apalis_redis::connect(redis_url)
-            .await
-            .expect("status conn");
+        let status_conn = apalis_redis::connect(redis_url).await.expect("status conn");
 
         let state = ApiState {
             resolver: Arc::new(resolver),

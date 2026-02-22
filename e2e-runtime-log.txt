@@ -1,0 +1,60 @@
+=== E2E EXEC RUN 2026-02-23T01:46:18+05:30 ===
+
+[health]
+ok
+
+[java exec: short version 21]
+job submitted: da3920ea-9711-4e66-8546-9e322ded6690
+resolved version: 21.0.10.7.1
+job_id: da3920ea-9711-4e66-8546-9e322ded6690
+status: completed
+language: java
+version: 21.0.10.7.1
+
+=== Result ===
+[compile]
+Status: Success
+Exit Code: 0
+Memory Usage: 78.64 MB
+CPU Time: 607.00 µs
+Execution Time: 234.00 ms
+Stderr:
+Picked up JAVA_TOOL_OPTIONS: -Xms16m -Xmx256m -XX:MaxMetaspaceSize=64m -XX:CompressedClassSpaceSize=32m -XX:ReservedCodeCacheSize=32m -XX:+UseSerialGC -Xss256k
+
+
+[run]
+Status: Success
+Exit Code: 0
+Memory Usage: 41.31 MB
+CPU Time: 26.00 µs
+Execution Time: 23.00 ms
+Stdout:
+hello-java
+
+Stderr:
+Picked up JAVA_TOOL_OPTIONS: -Xms8m -Xmx64m -XX:MaxMetaspaceSize=32m -XX:CompressedClassSpaceSize=16m -XX:ReservedCodeCacheSize=16m -XX:+UseSerialGC -Xss256k
+
+
+
+[python exec: short version 3.13]
+job submitted: 122eb48c-f4e8-4f97-8468-153e471bba8a
+resolved version: 3.13.12
+job_id: 122eb48c-f4e8-4f97-8468-153e471bba8a
+status: completed
+language: python
+version: 3.13.12
+
+=== Result ===
+[run]
+Status: Success
+Exit Code: 0
+Memory Usage: 13.80 MB
+CPU Time: 19.00 µs
+Execution Time: 53.00 ms
+Stdout:
+hello-python
+
+
+
+
+=== E2E EXEC END 2026-02-23T01:46:19+05:30 ===
