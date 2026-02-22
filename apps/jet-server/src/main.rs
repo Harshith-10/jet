@@ -1,6 +1,9 @@
 use jet_core::JetConfig;
 use jet_pack::{RedisVersionStore, VersionResolver};
 
+mod sandbox;
+mod worker;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = JetConfig::load()?;
 

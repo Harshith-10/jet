@@ -52,6 +52,9 @@ This is my running engineering diary for Jet so we do not lose feature intent, c
 - Exported Redis store from crate API for server-side consumption.
 - Decision confirmed: skip SHA256 verification for installs in this private project workflow.
 
+### Remember
+- Make worker/job submission use resolver.resolve(...) against Redis at runtime in jet-server once we add API/queue flow.
+
 ### Updater Architecture (Added)
 - Added trait-first updater model in `jet-pack` so each language keeps its own release parsing logic:
 	- `RuntimeUpdater` trait with `fetch_updated_manifests()`
