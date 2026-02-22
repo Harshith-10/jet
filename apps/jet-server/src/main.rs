@@ -1,25 +1,73 @@
+use std::{collections::HashMap, sync::Arc};
+
+use apalis_redis::RedisStorage;
 use jet_core::JetConfig;
 use jet_pack::{RedisVersionStore, VersionResolver};
+use tokio::sync::Mutex;
 
+mod api;
+mod queue;
 mod sandbox;
 mod worker;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = JetConfig::load()?;
 
     let redis_store = RedisVersionStore::new(&config.redis_url, &config.runtime_cache_key)?;
     let mut resolver = VersionResolver::new(redis_store);
     let manifests = resolver.initialize_from_manifest_dir(&config.runtimes_manifest_dir)?;
 
+    let mut manifest_map = HashMap::new();
+    for manifest in manifests {
+        manifest_map.insert(
+            format!("{}:{}", manifest.language, manifest.version),
+            manifest,
+        );
+    }
+    let manifest_count = manifest_map.len();
+
+    let conn = apalis_redis::connect(config.redis_url.clone()).await?;
+    let storage = RedisStorage::<queue::QueuedJob>::new(conn);
+    let redis_conn = Arc::new(Mutex::new(
+        apalis_redis::connect(config.redis_url.clone()).await?,
+    ));
+    let job_state_prefix = "jet:jobs".to_string();
+
+    let api_state = api::ApiState {
+        resolver: Arc::new(resolver),
+        manifests: Arc::new(manifest_map.clone()),
+        storage: Arc::new(Mutex::new(storage)),
+        redis_conn: redis_conn.clone(),
+        job_state_prefix: job_state_prefix.clone(),
+    };
+
+    let worker_context = worker::runner::WorkerContext {
+        manifests: Arc::new(manifest_map),
+        runtime_install_dir: config.runtime_install_dir.clone(),
+        redis_conn,
+        job_state_prefix,
+    };
+
+    let worker_redis_url = config.redis_url.clone();
+    tokio::spawn(async move {
+        if let Err(err) = worker::runner::run_worker(worker_redis_url, worker_context).await {
+            eprintln!("worker stopped with error: {err}");
+        }
+    });
+
+    let app = api::router(api_state);
+    let addr = format!("{}:{}", config.server_host, config.server_port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
     println!(
         "jet-server startup complete: loaded {} manifest(s), version map cached at key '{}'",
-        manifests.len(),
+        manifest_count,
         config.runtime_cache_key
     );
-    println!(
-        "server placeholder running on {}:{}",
-        config.server_host, config.server_port
-    );
+    println!("server running on {addr}");
+
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

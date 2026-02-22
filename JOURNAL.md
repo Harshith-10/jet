@@ -67,3 +67,47 @@ This is my running engineering diary for Jet so we do not lose feature intent, c
 - Future language updaters can be plugged in without changing manager flow.
 - Runtime-specific complexity stays local to each updater implementation.
 - The rest of the system consumes a single normalized manifest model.
+
+### Phase 3 Update (Latest)
+- Added Hakoniwa-based sandbox module in `jet-server` with namespace isolation and controlled mounts.
+- Implemented resource guardrails via `setrlimit` and optional cgroups configuration.
+- Implemented optional Landlock and Seccomp policy enforcement with an allowlist strategy.
+- Added `SandboxProfile` modes:
+	- `strict()` for hardened worker execution.
+	- `portable()` for deterministic local test execution where some kernel capabilities may not be available.
+- Added telemetry extraction (runtime/cpu/memory) and stage-status mapping to `StageStatus` values (`SUCCESS`, `TIME_LIMIT_EXCEEDED`, `MEMORY_LIMIT_EXCEEDED`, `OUTPUT_LIMIT_EXCEEDED`, runtime error fallback).
+- Added worker evaluator skeleton that runs compile and execute templates from manifests through sandboxed execution.
+- Added tests in `jet-server` for success and timeout behavior; full `cargo test -p jet-server` passes.
+- Important mount fix from Hakoniwa docs: avoid mixing `rootfs("/")` with explicit bind mounts for this flow to prevent mount/symlink conflicts.
+
+### Next (Phase 4 Start)
+- Wire REST job submission API to enqueue requests.
+- Resolve runtime versions via Redis-backed resolver during submission.
+- Connect queue consumer worker to evaluator execution path.
+
+### Phase 4 Update (In Progress)
+- Added async server runtime in `jet-server` using `tokio` + `axum`.
+- Added API module with:
+	- `GET /health` basic liveness.
+	- `POST /jobs` submission endpoint.
+- Added `GET /jobs/:id` endpoint for job state polling.
+- Submission flow now resolves `language:version_fragment` through Redis-backed `VersionResolver` before enqueueing.
+- Added Redis queue integration via `apalis-redis`:
+	- Producer pushes normalized jobs after version resolution.
+	- Worker consumes queued jobs and executes evaluator pipeline.
+- Added `QueuedJob` model to persist normalized payload (`id`, `language`, exact `version`, full request).
+- Added Redis-backed `JobStateRecord` persistence for lifecycle states:
+	- `queued` on submission.
+	- `running` when worker starts execution.
+	- `completed` with full `JobResult` payload when evaluation succeeds.
+	- `failed` with error message when evaluation fails.
+- Main server startup now runs both:
+	- HTTP API listener.
+	- Background worker loop.
+- Validation:
+	- `cargo check -p jet-server` passes.
+	- `cargo test -p jet-server` passes.
+
+### Phase 4 Next Steps
+- Improve worker runtime path resolution with architecture/runtime checks before execute.
+- Add API integration tests for submit + poll flow (requires controllable Redis in test harness).
