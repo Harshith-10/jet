@@ -4,3 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+jet-core = { path = "../../crates/jet-core" }
+jet-pack = { path = "../../crates/jet-pack" }

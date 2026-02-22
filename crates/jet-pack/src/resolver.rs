@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs, path::Path};
 
+use redis::Commands;
 use semver::Version;
 
 use crate::{
@@ -8,8 +9,8 @@ use crate::{
 };
 
 pub trait VersionStore {
-    fn set_many(&mut self, entries: HashMap<String, String>);
-    fn get(&self, key: &str) -> Option<String>;
+    fn set_many(&mut self, entries: HashMap<String, String>) -> JetPackResult<()>;
+    fn get(&self, key: &str) -> JetPackResult<Option<String>>;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -18,12 +19,82 @@ pub struct InMemoryVersionStore {
 }
 
 impl VersionStore for InMemoryVersionStore {
-    fn set_many(&mut self, entries: HashMap<String, String>) {
+    fn set_many(&mut self, entries: HashMap<String, String>) -> JetPackResult<()> {
         self.map = entries;
+        Ok(())
     }
 
-    fn get(&self, key: &str) -> Option<String> {
-        self.map.get(key).cloned()
+    fn get(&self, key: &str) -> JetPackResult<Option<String>> {
+        Ok(self.map.get(key).cloned())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RedisVersionStore {
+    client: redis::Client,
+    redis_key: String,
+}
+
+impl RedisVersionStore {
+    pub fn new(redis_url: &str, redis_key: impl Into<String>) -> JetPackResult<Self> {
+        let client = redis::Client::open(redis_url).map_err(|source| JetPackError::Redis {
+            operation: "client_open".to_string(),
+            source,
+        })?;
+
+        Ok(Self {
+            client,
+            redis_key: redis_key.into(),
+        })
+    }
+}
+
+impl VersionStore for RedisVersionStore {
+    fn set_many(&mut self, entries: HashMap<String, String>) -> JetPackResult<()> {
+        let mut conn = self
+            .client
+            .get_connection()
+            .map_err(|source| JetPackError::Redis {
+                operation: "connect".to_string(),
+                source,
+            })?;
+
+        let _: usize = conn
+            .del(&self.redis_key)
+            .map_err(|source| JetPackError::Redis {
+                operation: "del".to_string(),
+                source,
+            })?;
+
+        for (key, value) in entries {
+            let _: usize = conn
+                .hset(&self.redis_key, key, value)
+                .map_err(|source| JetPackError::Redis {
+                    operation: "hset".to_string(),
+                    source,
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> JetPackResult<Option<String>> {
+        let mut conn = self
+            .client
+            .get_connection()
+            .map_err(|source| JetPackError::Redis {
+                operation: "connect".to_string(),
+                source,
+            })?;
+
+        let value = conn
+            .hget(&self.redis_key, key)
+            .map_err(|source| JetPackError::Redis {
+                operation: "hget".to_string(),
+                source,
+            })?;
+
+        Ok(value)
     }
 }
 
@@ -39,7 +110,7 @@ impl<S: VersionStore> VersionResolver<S> {
 
     pub fn initialize_from_manifests(&mut self, manifests: &[RuntimeManifest]) -> JetPackResult<()> {
         let map = build_version_map(manifests)?;
-        self.store.set_many(map);
+        self.store.set_many(map)?;
         Ok(())
     }
 
@@ -49,7 +120,7 @@ impl<S: VersionStore> VersionResolver<S> {
         Ok(manifests)
     }
 
-    pub fn resolve(&self, language: &str, requested: &str) -> Option<String> {
+    pub fn resolve(&self, language: &str, requested: &str) -> JetPackResult<Option<String>> {
         self.store.get(&format!("{}:{}", language, requested))
     }
 }
@@ -215,6 +286,11 @@ compile: null
             .initialize_from_manifests(&[manifest("rust", "1.87.0")])
             .expect("resolver init should work");
 
-        assert_eq!(resolver.resolve("rust", "1.86"), None);
+        assert_eq!(
+            resolver
+                .resolve("rust", "1.86")
+                .expect("resolve should succeed"),
+            None
+        );
     }
 }

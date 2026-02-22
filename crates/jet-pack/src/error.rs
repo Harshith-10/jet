@@ -42,4 +42,11 @@ pub enum JetPackError {
 
     #[error("serialization error: {message}")]
     Serialization { message: String },
+
+    #[error("redis operation failed ({operation}): {source}")]
+    Redis {
+        operation: String,
+        #[source]
+        source: redis::RedisError,
+    },
 }

@@ -42,9 +42,15 @@ This is my running engineering diary for Jet so we do not lose feature intent, c
 - Added comprehensive unit tests for success and failure paths.
 
 ### Next Phase 2 Increments
-- Add Redis-backed `VersionStore` implementation for shared lookups across server workers.
 - Add checksum verification (`sha256`) during runtime archive install.
 - Add repository release polling helper for latest manifest/runtime discovery.
+
+### Phase 2 Update (Latest)
+- Completed Redis-backed version store in `jet-pack` resolver layer.
+- `VersionStore` now returns `JetPackResult` so backend failures are surfaced (important for Redis connectivity/runtime errors).
+- Added `RedisVersionStore` with hash-key persistence (`DEL` + `HSET` write path, `HGET` read path).
+- Exported Redis store from crate API for server-side consumption.
+- Decision confirmed: skip SHA256 verification for installs in this private project workflow.
 
 ### Updater Architecture (Added)
 - Added trait-first updater model in `jet-pack` so each language keeps its own release parsing logic:
