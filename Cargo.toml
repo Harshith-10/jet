@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/jet-cli",
+    "apps/jet-server",
+    "crates/jet-core",
+    "crates/jet-pack",
+]
