@@ -1,12 +1,12 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use apalis::prelude::*;
 use apalis_redis::RedisStorage;
+use deadpool_redis::{Pool, redis::AsyncCommands};
 use jet_core::models::ExecutionLimits;
 use jet_pack::manifest::RuntimeManifest;
-use redis::{AsyncCommands, aio::ConnectionManager};
 use tokio::fs;
-use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -18,23 +18,29 @@ use crate::{
 pub struct WorkerContext {
     pub manifests: Arc<HashMap<String, RuntimeManifest>>,
     pub runtime_install_dir: PathBuf,
-    pub redis_conn: Arc<Mutex<ConnectionManager>>,
+    pub redis_pool: Pool,
     pub job_state_prefix: String,
+    pub jobs_completed: Arc<AtomicU64>,
+    pub jobs_failed: Arc<AtomicU64>,
+    pub jobs_in_flight: Arc<AtomicU64>,
 }
 
 pub async fn run_worker(
+    name: String,
     redis_url: String,
     context: WorkerContext,
+    concurrency: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let conn = apalis_redis::connect(redis_url).await?;
     let storage = RedisStorage::<QueuedJob>::new(conn);
 
-    let worker = WorkerBuilder::new("jet-worker")
-        .data(context)
+    let worker = WorkerBuilder::new(&name)
         .backend(storage)
-        .build_fn(handle_job);
+        .concurrency(concurrency)
+        .data(context)
+        .build(handle_job);
 
-    worker.run().await;
+    worker.run().await?;
     Ok(())
 }
 
@@ -47,7 +53,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
     );
 
     write_job_state(
-        &data.redis_conn,
+        &data.redis_pool,
         &data.job_state_prefix,
         JobStateRecord {
             job_id: job.id.clone(),
@@ -72,8 +78,10 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                 duration_ms = elapsed.as_millis() as u64,
                 "job completed successfully"
             );
+            data.jobs_completed.fetch_add(1, Ordering::Relaxed);
+            data.jobs_in_flight.fetch_sub(1, Ordering::Relaxed);
             write_job_state(
-                &data.redis_conn,
+                &data.redis_pool,
                 &data.job_state_prefix,
                 JobStateRecord {
                     job_id: job.id.clone(),
@@ -94,8 +102,10 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                 duration_ms = elapsed.as_millis() as u64,
                 "job failed"
             );
+            data.jobs_failed.fetch_add(1, Ordering::Relaxed);
+            data.jobs_in_flight.fetch_sub(1, Ordering::Relaxed);
             write_job_state(
-                &data.redis_conn,
+                &data.redis_pool,
                 &data.job_state_prefix,
                 JobStateRecord {
                     job_id: job.id.clone(),
@@ -161,25 +171,37 @@ async fn process_job(
         limits.output_limit_bytes = output_limit;
     }
 
-    let evaluator = Evaluator::new(
-        workspace_dir.clone(),
-        Some(runtime_root_dir),
-        manifest,
-        limits,
-    );
-    let result = evaluator
-        .evaluate(&job.request)
-        .map_err(|source| std::io::Error::other(source.to_string()));
+    // Run the evaluator on a blocking thread so it doesn't starve
+    // the async runtime while sandbox processes are executing.
+    let request = job.request.clone();
+    let ws = workspace_dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let evaluator = Evaluator::new(ws, Some(runtime_root_dir), manifest, limits);
+        evaluator
+            .evaluate(&request)
+            .map_err(|source| std::io::Error::other(source.to_string()))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("spawn_blocking join error: {e}")));
 
-    if let Err(e) = fs::remove_dir_all(&workspace_dir).await {
-        warn!(
-            job_id = %job.id,
-            error = %e,
-            "failed to cleanup workspace"
-        );
+    // Always clean up workspace, regardless of success or failure.
+    cleanup_workspace(&workspace_dir, &job.id).await;
+
+    result?
+}
+
+async fn cleanup_workspace(workspace_dir: &std::path::Path, job_id: &str) {
+    if let Err(e) = fs::remove_dir_all(workspace_dir).await {
+        // Ignore NotFound — the workspace may never have been created
+        // (e.g. manifest validation failed before create_dir_all).
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                job_id = %job_id,
+                error = %e,
+                "failed to cleanup workspace"
+            );
+        }
     }
-
-    result
 }
 
 fn normalize_arch(arch: &str) -> &str {
@@ -202,19 +224,32 @@ mod tests {
     }
 }
 
+/// TTL for terminal job states (completed / failed) so they don't
+/// accumulate in Redis forever.
+const JOB_STATE_TTL_SECS: u64 = 3600; // 1 hour
+
 async fn write_job_state(
-    redis_conn: &Arc<Mutex<ConnectionManager>>,
+    pool: &Pool,
     prefix: &str,
     state: JobStateRecord,
 ) -> Result<(), std::io::Error> {
     let key = job_state_key(prefix, &state.job_id);
     let payload = serde_json::to_string(&state)
         .map_err(|source| std::io::Error::other(source.to_string()))?;
-    let _: () = redis_conn
-        .lock()
-        .await
-        .set::<String, String, ()>(key, payload)
+    let is_terminal = state.status == "completed" || state.status == "failed";
+    let mut conn = pool
+        .get()
         .await
         .map_err(|source| std::io::Error::other(source.to_string()))?;
+    let _: () = conn
+        .set::<_, _, ()>(&key, &payload)
+        .await
+        .map_err(|source| std::io::Error::other(source.to_string()))?;
+    if is_terminal {
+        let _: () = conn
+            .expire::<_, ()>(&key, JOB_STATE_TTL_SECS as i64)
+            .await
+            .map_err(|source| std::io::Error::other(source.to_string()))?;
+    }
     Ok(())
 }

@@ -1,6 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use apalis::prelude::Storage;
+use apalis::prelude::TaskSink;
 use apalis_redis::RedisStorage;
 use axum::{
     Json, Router,
@@ -8,32 +15,42 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use deadpool_redis::{Pool, redis::AsyncCommands};
 use jet_core::models::JobRequest;
 use jet_pack::{RedisVersionStore, VersionResolver, manifest::RuntimeManifest};
-use redis::{AsyncCommands, aio::ConnectionManager};
-use tokio::sync::Mutex;
+use serde::Serialize;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::queue::{JobStateRecord, QueuedJob, job_state_key};
 
 pub type SharedResolver = Arc<VersionResolver<RedisVersionStore>>;
-pub type SharedStorage = Arc<Mutex<RedisStorage<QueuedJob>>>;
+pub type SharedStorage = Arc<tokio::sync::Mutex<RedisStorage<QueuedJob>>>;
 pub type SharedManifests = Arc<HashMap<String, RuntimeManifest>>;
-pub type SharedRedisConn = Arc<Mutex<ConnectionManager>>;
 
 #[derive(Clone)]
 pub struct ApiState {
     pub resolver: SharedResolver,
     pub manifests: SharedManifests,
     pub storage: SharedStorage,
-    pub redis_conn: SharedRedisConn,
+    pub redis_pool: Pool,
     pub job_state_prefix: String,
+    pub start_time: Instant,
+    pub jobs_submitted: Arc<AtomicU64>,
+    pub jobs_completed: Arc<AtomicU64>,
+    pub jobs_failed: Arc<AtomicU64>,
+    pub worker_concurrency: usize,
+    pub jobs_in_flight: Arc<AtomicU64>,
+    pub max_queue_depth: u64,
 }
 
 const MAX_FILES: usize = 100;
 const MAX_TESTCASES: usize = 1000;
 const MAX_TOTAL_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+
+/// TTL for job state keys set from the API side.
+const JOB_STATE_TTL_SECS: i64 = 3600; // 1 hour
 
 fn validate_job_request(req: &JobRequest) -> Result<(), (StatusCode, String)> {
     if req.files.is_empty() {
@@ -86,18 +103,67 @@ fn validate_job_request(req: &JobRequest) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 pub struct SubmitJobResponse {
     pub job_id: String,
     pub status: String,
     pub resolved_version: String,
 }
 
+#[derive(Serialize)]
+pub struct RuntimeInfo {
+    pub version: String,
+    pub aliases: Vec<String>,
+    pub architectures: Vec<String>,
+    pub compiled: bool,
+}
+
+#[derive(Serialize)]
+pub struct RuntimesResponse {
+    pub total: usize,
+    pub languages: HashMap<String, Vec<RuntimeInfo>>,
+}
+
+#[derive(Serialize)]
+pub struct StatsResponse {
+    pub uptime_seconds: u64,
+    pub jobs_submitted: u64,
+    pub jobs_completed: u64,
+    pub jobs_failed: u64,
+    pub jobs_in_flight: u64,
+    pub max_queue_depth: u64,
+    pub installed_runtimes: usize,
+    pub supported_languages: Vec<String>,
+    pub worker_concurrency: usize,
+    pub host_arch: String,
+}
+
 pub fn router(state: ApiState) -> Router {
+    // Rate limiting: 10 requests per second per IP, burst of 30.
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(10)
+        .burst_size(30)
+        .finish()
+        .unwrap();
+
+    // Background cleanup of expired rate-limit entries.
+    let governor_limiter = governor_conf.limiter().clone();
+    let interval = Duration::from_secs(60);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(interval);
+            governor_limiter.retain_recent();
+        }
+    });
+
     Router::new()
         .route("/health", get(health))
         .route("/jobs", post(submit_job))
         .route("/jobs/{id}", get(get_job))
+        .route("/runtimes", get(list_runtimes))
+        .route("/runtimes/{language}", get(get_language_runtimes))
+        .route("/stats", get(get_stats))
+        .layer(GovernorLayer::new(governor_conf))
         .with_state(state)
 }
 
@@ -109,6 +175,23 @@ async fn submit_job(
     State(state): State<ApiState>,
     Json(mut request): Json<JobRequest>,
 ) -> Result<(StatusCode, Json<SubmitJobResponse>), (StatusCode, String)> {
+    // Backpressure: reject if too many jobs are already in-flight.
+    let in_flight = state.jobs_in_flight.load(Ordering::Relaxed);
+    if in_flight >= state.max_queue_depth {
+        warn!(
+            in_flight = in_flight,
+            max = state.max_queue_depth,
+            "rejecting job: queue full"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "server is overloaded: {} jobs in flight (max: {})",
+                in_flight, state.max_queue_depth
+            ),
+        ));
+    }
+
     validate_job_request(&request).map_err(|e| {
         warn!(language = %request.language, reason = %e.1, "job submission rejected: validation");
         e
@@ -126,7 +209,7 @@ async fn submit_job(
         .ok_or((
             StatusCode::BAD_REQUEST,
             format!(
-                "unsupported language/version fragment: {}:{}",
+                "runtime not installed or unsupported: {}:{}",
                 request.language, requested
             ),
         ))?;
@@ -135,7 +218,7 @@ async fn submit_job(
     if !state.manifests.contains_key(&manifest_key) {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("manifest not found for {}", manifest_key),
+            format!("runtime is not installed: {}", manifest_key),
         ));
     }
 
@@ -162,6 +245,9 @@ async fn submit_job(
         .await
         .map_err(internal_error)?;
 
+    // Track in-flight job count for backpressure.
+    state.jobs_in_flight.fetch_add(1, Ordering::Relaxed);
+
     let queued_state = JobStateRecord {
         job_id: job_id.clone(),
         status: "queued".to_string(),
@@ -173,13 +259,19 @@ async fn submit_job(
 
     let state_key = job_state_key(&state.job_state_prefix, &job_id);
     let payload = serde_json::to_string(&queued_state).map_err(internal_error)?;
-    let _: () = state
-        .redis_conn
-        .lock()
-        .await
-        .set::<String, String, ()>(state_key, payload)
-        .await
-        .map_err(internal_error)?;
+    {
+        let mut conn = state.redis_pool.get().await.map_err(internal_error)?;
+        let _: () = conn
+            .set::<_, _, ()>(&state_key, &payload)
+            .await
+            .map_err(internal_error)?;
+        let _: () = conn
+            .expire::<_, ()>(&state_key, JOB_STATE_TTL_SECS)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    state.jobs_submitted.fetch_add(1, Ordering::Relaxed);
 
     info!(
         job_id = %job_id,
@@ -203,11 +295,9 @@ async fn get_job(
     State(state): State<ApiState>,
 ) -> Result<(StatusCode, Json<JobStateRecord>), (StatusCode, String)> {
     let key = job_state_key(&state.job_state_prefix, &id);
-    let raw: Option<String> = state
-        .redis_conn
-        .lock()
-        .await
-        .get::<String, Option<String>>(key)
+    let mut conn = state.redis_pool.get().await.map_err(internal_error)?;
+    let raw: Option<String> = conn
+        .get::<_, Option<String>>(&key)
         .await
         .map_err(internal_error)?;
 
@@ -219,18 +309,95 @@ async fn get_job(
     Ok((StatusCode::OK, Json(parsed)))
 }
 
+async fn list_runtimes(State(state): State<ApiState>) -> Json<RuntimesResponse> {
+    let languages = build_runtime_map(&state.manifests);
+    let total: usize = languages.values().map(|v| v.len()).sum();
+    Json(RuntimesResponse { total, languages })
+}
+
+async fn get_language_runtimes(
+    Path(language): Path<String>,
+    State(state): State<ApiState>,
+) -> Result<Json<RuntimesResponse>, (StatusCode, String)> {
+    let all = build_runtime_map(&state.manifests);
+    let filtered: HashMap<String, Vec<RuntimeInfo>> = all
+        .into_iter()
+        .filter(|(lang, _)| lang == &language)
+        .collect();
+
+    if filtered.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no installed runtimes for language: {}", language),
+        ));
+    }
+
+    let total: usize = filtered.values().map(|v| v.len()).sum();
+    Ok(Json(RuntimesResponse {
+        total,
+        languages: filtered,
+    }))
+}
+
+async fn get_stats(State(state): State<ApiState>) -> Json<StatsResponse> {
+    let uptime = state.start_time.elapsed();
+    let mut langs: Vec<String> = state
+        .manifests
+        .values()
+        .map(|m| m.language.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    langs.sort();
+
+    Json(StatsResponse {
+        uptime_seconds: uptime.as_secs(),
+        jobs_submitted: state.jobs_submitted.load(Ordering::Relaxed),
+        jobs_completed: state.jobs_completed.load(Ordering::Relaxed),
+        jobs_failed: state.jobs_failed.load(Ordering::Relaxed),
+        jobs_in_flight: state.jobs_in_flight.load(Ordering::Relaxed),
+        max_queue_depth: state.max_queue_depth,
+        installed_runtimes: state.manifests.len(),
+        supported_languages: langs,
+        worker_concurrency: state.worker_concurrency,
+        host_arch: std::env::consts::ARCH.to_string(),
+    })
+}
+
+fn build_runtime_map(manifests: &SharedManifests) -> HashMap<String, Vec<RuntimeInfo>> {
+    let mut map: HashMap<String, Vec<RuntimeInfo>> = HashMap::new();
+    for manifest in manifests.values() {
+        let mut archs: Vec<String> = manifest.runtimes.keys().cloned().collect();
+        archs.sort();
+        let info = RuntimeInfo {
+            version: manifest.version.clone(),
+            aliases: manifest.aliases.clone(),
+            architectures: archs,
+            compiled: manifest.compile.is_some(),
+        };
+        map.entry(manifest.language.clone()).or_default().push(info);
+    }
+
+    // Sort versions within each language for consistent output
+    for versions in map.values_mut() {
+        versions.sort_by(|a, b| a.version.cmp(&b.version));
+    }
+
+    map
+}
+
 fn internal_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, sync::Arc, sync::atomic::AtomicU64, time::Instant};
 
     use apalis_redis::RedisStorage;
     use axum::{extract::Path, extract::State, http::StatusCode};
+    use deadpool_redis::{Config as PoolConfig, Runtime as PoolRuntime, redis::AsyncCommands};
     use mini_redis::server;
-    use redis::AsyncCommands;
     use tokio::{
         net::TcpListener,
         sync::{Mutex, oneshot},
@@ -261,14 +428,26 @@ mod tests {
         let queue_conn = apalis_redis::connect(redis_url.clone())
             .await
             .expect("queue conn");
-        let status_conn = apalis_redis::connect(redis_url).await.expect("status conn");
+
+        // Create a deadpool-redis connection pool for tests.
+        let pool_cfg = PoolConfig::from_url(&redis_url);
+        let pool = pool_cfg
+            .create_pool(Some(PoolRuntime::Tokio1))
+            .expect("pool creation");
 
         let state = ApiState {
             resolver: Arc::new(resolver),
             manifests: Arc::new(HashMap::new()),
             storage: Arc::new(Mutex::new(RedisStorage::<QueuedJob>::new(queue_conn))),
-            redis_conn: Arc::new(Mutex::new(status_conn)),
+            redis_pool: pool,
             job_state_prefix: "jet:test:jobs".to_string(),
+            start_time: Instant::now(),
+            jobs_submitted: Arc::new(AtomicU64::new(0)),
+            jobs_completed: Arc::new(AtomicU64::new(0)),
+            jobs_failed: Arc::new(AtomicU64::new(0)),
+            worker_concurrency: 1,
+            jobs_in_flight: Arc::new(AtomicU64::new(0)),
+            max_queue_depth: 100,
         };
 
         (state, shutdown_tx)
@@ -288,13 +467,13 @@ mod tests {
         };
         let payload = serde_json::to_string(&record).expect("serialize record");
         let key = job_state_key(&state.job_state_prefix, &record.job_id);
-        let _: () = state
-            .redis_conn
-            .lock()
-            .await
-            .set::<String, String, ()>(key, payload)
-            .await
-            .expect("seed redis");
+        {
+            let mut conn = state.redis_pool.get().await.expect("pool conn");
+            let _: () = conn
+                .set::<_, _, ()>(&key, &payload)
+                .await
+                .expect("seed redis");
+        }
 
         let (status, body) = get_job(Path("job-1".to_string()), State(state.clone()))
             .await

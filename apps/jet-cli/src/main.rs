@@ -11,9 +11,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
+use console::{Emoji, Style, style};
 use futures::future::join_all;
+use indicatif::{ProgressBar, ProgressStyle};
 use jet_core::{FileRequest, JetConfig, JobRequest, JobResult};
-use jet_pack::{ManifestSource, PackageManager};
+use jet_pack::{JavaCorrettoUpdater, PackageManager, PythonStandaloneUpdater};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -76,33 +78,58 @@ struct ExecArgs {
 
 #[derive(Args, Debug, Clone)]
 struct BenchmarkArgs {
+    #[arg(help = "Language to benchmark")]
     language: String,
 
-    #[arg(short = 'f', long = "file", required = true)]
-    files: Vec<PathBuf>,
-
-    #[arg(short = 'v', long = "version", default_value = "latest")]
+    #[arg(
+        short = 'v',
+        long = "version",
+        default_value = "latest",
+        help = "Language version (resolves to latest patch)"
+    )]
     version: String,
 
-    #[arg(short = 'c', long = "concurrency", default_value_t = 5)]
+    #[arg(
+        short = 'f',
+        long = "file",
+        required = true,
+        help = "Source files to execute"
+    )]
+    files: Vec<PathBuf>,
+
+    #[arg(
+        short = 'c',
+        long = "concurrency",
+        default_value_t = 5,
+        help = "Number of concurrent workers"
+    )]
     concurrency: usize,
 
-    #[arg(short = 'n', long = "requests", default_value_t = 100)]
+    #[arg(
+        short = 'n',
+        long = "requests",
+        default_value_t = 100,
+        help = "Total number of requests to perform"
+    )]
     requests: usize,
 
-    #[arg(short = 'd', long = "delay", value_parser = parse_duration, default_value = "500ms")]
+    #[arg(short = 'd', long = "delay", value_parser = parse_duration, default_value = "500ms", help = "Delay between requests for each worker")]
     delay: Duration,
 
-    #[arg(long = "stdin")]
+    #[arg(long = "stdin", help = "Input file for stdin")]
     stdin_file: Option<PathBuf>,
 
-    #[arg(long = "server", default_value = "http://127.0.0.1:4000")]
+    #[arg(
+        long = "server",
+        default_value = "http://127.0.0.1:4000",
+        help = "Jet server URL"
+    )]
     server: String,
 
-    #[arg(long = "poll-interval", value_parser = parse_duration, default_value = "200ms")]
+    #[arg(long = "poll-interval", value_parser = parse_duration, default_value = "200ms", help = "Interval to poll job status")]
     poll_interval: Duration,
 
-    #[arg(long = "poll-timeout", value_parser = parse_duration, default_value = "60s")]
+    #[arg(long = "poll-timeout", value_parser = parse_duration, default_value = "60s", help = "Timeout for single job completion")]
     poll_timeout: Duration,
 
     #[arg(long = "run-timeout-ms")]
@@ -124,6 +151,13 @@ struct BenchmarkArgs {
     compile_output_limit: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum UpdateTarget {
+    Java,
+    Python,
+    All,
+}
+
 #[derive(Subcommand, Debug)]
 enum RuntimesSubcommands {
     List,
@@ -134,8 +168,8 @@ enum RuntimesSubcommands {
         arch: String,
     },
     Update {
-        #[arg(long = "source", value_parser = parse_manifest_source)]
-        sources: Vec<ManifestSource>,
+        #[arg(value_enum, default_value = "all")]
+        language: UpdateTarget,
     },
 }
 
@@ -206,9 +240,25 @@ fn main() -> Result<()> {
 }
 
 async fn execute_command(args: ExecArgs) -> Result<()> {
-    let request = build_job_request(
+    let config = JetConfig::load()?;
+    let manager = PackageManager::new(
+        config.runtime_install_dir.clone(),
+        config.runtimes_manifest_dir.clone(),
+    );
+    let resolver = manager.build_resolver()?;
+    let resolved_version = resolver
+        .resolve(&args.language, &args.version)?
+        .ok_or_else(|| {
+            anyhow!(
+                "unsupported version: {} for {}",
+                args.version,
+                args.language
+            )
+        })?;
+
+    let mut request = build_job_request(
         &args.language,
-        &args.version,
+        &resolved_version,
         &args.files,
         args.stdin_file.as_deref(),
         &CommonLimits {
@@ -220,6 +270,7 @@ async fn execute_command(args: ExecArgs) -> Result<()> {
             compile_output_limit: args.compile_output_limit,
         },
     )?;
+    request.version = Some(resolved_version.clone());
 
     let client = reqwest::Client::new();
     let submit = submit_job(&client, &args.server, &request).await?;
@@ -248,9 +299,43 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
         bail!("requests must be >= 1");
     }
 
-    let request_template = build_job_request(
+    let config = JetConfig::load()?;
+    let manager = PackageManager::new(
+        config.runtime_install_dir.clone(),
+        config.runtimes_manifest_dir.clone(),
+    );
+
+    println!();
+    let spinner = make_spinner();
+    spinner.set_message(format!("{}Resolving version…", LOOKING_GLASS));
+
+    let resolver = manager.build_resolver()?;
+    let resolved_version = resolver
+        .resolve(&args.language, &args.version)?
+        .ok_or_else(|| {
+            spinner.finish_and_clear();
+            anyhow!(
+                "unsupported version: {} for {}",
+                args.version,
+                args.language
+            )
+        })?;
+
+    spinner.finish_with_message(format!(
+        "{}Benchmark target: {}:{} ({})",
+        CHECKMARK,
+        style(&args.language).green(),
+        style(&resolved_version).yellow(),
+        style(format!(
+            "concurrency={}, requests={}",
+            args.concurrency, args.requests
+        ))
+        .dim()
+    ));
+
+    let mut request_template = build_job_request(
         &args.language,
-        &args.version,
+        &resolved_version,
         &args.files,
         args.stdin_file.as_deref(),
         &CommonLimits {
@@ -262,17 +347,24 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
             compile_output_limit: args.compile_output_limit,
         },
     )?;
+    request_template.version = Some(resolved_version.clone());
 
-    println!(
-        "benchmark start: concurrency={} requests={} delay={:?}",
-        args.concurrency, args.requests, args.delay
+    let pb = ProgressBar::new(args.requests as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg}\n  {wide_bar:.green/white.dim} {pos}/{len} ({percent}%, {remaining} left)"
+        )
+        .unwrap()
+        .progress_chars("━━╺━"),
     );
+    pb.set_message(format!("{}Running benchmark…", GAUGE));
 
     let start = Instant::now();
     let next_index = Arc::new(AtomicUsize::new(0));
     let success_counter = Arc::new(AtomicUsize::new(0));
     let failure_counter = Arc::new(AtomicUsize::new(0));
     let latencies = Arc::new(Mutex::new(Vec::<Duration>::new()));
+    let first_error = Arc::new(Mutex::new(None));
 
     let mut tasks = Vec::new();
     for _ in 0..args.concurrency {
@@ -280,11 +372,13 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
         let success = success_counter.clone();
         let failure = failure_counter.clone();
         let latencies = latencies.clone();
+        let first_err = first_error.clone();
         let server = args.server.clone();
         let poll_interval = args.poll_interval;
         let poll_timeout = args.poll_timeout;
         let delay = args.delay;
         let template = request_template.clone();
+        let pb = pb.clone();
 
         tasks.push(tokio::spawn(async move {
             let client = reqwest::Client::new();
@@ -315,14 +409,26 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
                             success.fetch_add(1, Ordering::SeqCst);
                         } else {
                             failure.fetch_add(1, Ordering::SeqCst);
+                            let mut fe = first_err.lock().await;
+                            if fe.is_none() {
+                                *fe = Some(format!(
+                                    "Job {} failed with status: {}",
+                                    state.job_id, state.status
+                                ));
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         failure.fetch_add(1, Ordering::SeqCst);
+                        let mut fe = first_err.lock().await;
+                        if fe.is_none() {
+                            *fe = Some(format!("{}", e));
+                        }
                     }
                 }
 
                 latencies.lock().await.push(per_req_start.elapsed());
+                pb.inc(1);
                 tokio::time::sleep(delay).await;
             }
         }));
@@ -333,6 +439,12 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
     }
 
     let elapsed = start.elapsed();
+    pb.finish_with_message(format!(
+        "{}Benchmark finished in {:.2}s",
+        CHECKMARK,
+        elapsed.as_secs_f64()
+    ));
+
     let successes = success_counter.load(Ordering::SeqCst);
     let failures = failure_counter.load(Ordering::SeqCst);
     let mut samples = latencies.lock().await.clone();
@@ -350,16 +462,71 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
         0.0
     };
 
-    println!("benchmark finished");
-    println!("  total requests: {}", successes + failures);
-    println!("  successes: {}", successes);
-    println!("  failures: {}", failures);
-    println!("  elapsed: {:.3}s", elapsed.as_secs_f64());
-    println!("  throughput: {:.2} req/s", throughput);
-    println!("  avg latency: {:.3}s", avg_latency.as_secs_f64());
-    println!("  p95 latency: {:.3}s", p95_latency.as_secs_f64());
+    println!("  {}", style("─".repeat(48)).dim());
+    println!(
+        "  {} Successes: {}",
+        style("●").green(),
+        style(successes).bold()
+    );
+    println!(
+        "  {} Failures:  {}",
+        style("●").red(),
+        style(failures).bold()
+    );
+    println!("  {}", style("─".repeat(48)).dim());
+    println!("  Throughput:  {:.2} req/s", style(throughput).cyan());
+    println!(
+        "  Avg Latency: {:.3}s",
+        style(avg_latency.as_secs_f64()).yellow()
+    );
+    println!(
+        "  P95 Latency: {:.3}s",
+        style(p95_latency.as_secs_f64()).yellow()
+    );
+
+    if failures > 0 {
+        if let Some(err) = first_error.lock().await.as_ref() {
+            println!("\n  {} First error: {}", CROSS, style(err).red());
+        }
+    }
+    println!();
 
     Ok(())
+}
+
+// ── Emoji & Style Constants ──────────────────────────────────────────────────
+static PACKAGE: Emoji<'_, '_> = Emoji("📦 ", "");
+static LOOKING_GLASS: Emoji<'_, '_> = Emoji("🔍 ", "");
+static DOWNLOAD: Emoji<'_, '_> = Emoji("⬇️  ", "");
+static SPARKLE: Emoji<'_, '_> = Emoji("\u{2728} ", "");
+static CHECKMARK: Emoji<'_, '_> = Emoji("✅ ", "[OK] ");
+static CROSS: Emoji<'_, '_> = Emoji("❌ ", "[ERR] ");
+static REFRESH: Emoji<'_, '_> = Emoji("🔄 ", "");
+static GAUGE: Emoji<'_, '_> = Emoji("⏱️  ", "");
+
+fn make_spinner() -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
+}
+
+fn make_download_bar() -> ProgressBar {
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg}\n  {wide_bar:.green/white.dim} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})"
+        )
+        .unwrap()
+        .progress_chars("━━╺━")
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
 }
 
 fn runtimes_command(cmd: RuntimesCommand) -> Result<()> {
@@ -370,45 +537,215 @@ fn runtimes_command(cmd: RuntimesCommand) -> Result<()> {
     );
 
     match cmd.command {
-        RuntimesSubcommands::List => {
-            let manifests = manager.scan_manifests()?;
-            if manifests.is_empty() {
-                println!(
-                    "no manifests found in {}",
-                    config.runtimes_manifest_dir.display()
-                );
-                return Ok(());
-            }
-            for m in manifests {
-                let archs: Vec<_> = m.runtimes.keys().cloned().collect();
-                println!("{} {} [{}]", m.language, m.version, archs.join(", "));
-            }
-            Ok(())
-        }
+        RuntimesSubcommands::List => runtimes_list(&manager, &config),
         RuntimesSubcommands::Install {
             language,
             version,
             arch,
-        } => {
-            let manifests = manager.scan_manifests()?;
-            let manifest = manifests
-                .into_iter()
-                .find(|m| m.language == language && m.version == version)
-                .ok_or_else(|| anyhow!("manifest not found for {language}:{version}"))?;
+        } => runtimes_install(&manager, &language, &version, &arch),
+        RuntimesSubcommands::Update { language } => runtimes_update(&manager, language),
+    }
+}
 
-            let installed = manager.install_runtime(&manifest, &arch)?;
-            println!("installed runtime at {}", installed.display());
+fn runtimes_list(manager: &PackageManager, config: &JetConfig) -> Result<()> {
+    let header = Style::new().bold().cyan();
+    let dim = Style::new().dim();
+    let lang_style = Style::new().bold().green();
+    let ver_style = Style::new().yellow();
+
+    let manifests = manager.scan_manifests()?;
+    if manifests.is_empty() {
+        println!(
+            "{}No manifests found in {}\n  Run {} to add manifests.",
+            dim.apply_to("  "),
+            style(config.runtimes_manifest_dir.display()).underlined(),
+            style("jet-cli runtimes update --source <name>=<url>").bold()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n  {} {}\n",
+        PACKAGE,
+        header.apply_to(format!("Available Runtimes ({})", manifests.len()))
+    );
+
+    for m in &manifests {
+        let archs: Vec<_> = m.runtimes.keys().cloned().collect();
+        let installed_path = manager
+            .runtime_dir
+            .join(&m.language)
+            .join(&m.version)
+            .join("root");
+        let is_installed = installed_path.exists();
+
+        let dot = if is_installed {
+            style("●").green()
+        } else {
+            style("●").red()
+        };
+
+        println!(
+            "  {} {:<12} {:<14} {}",
+            dot,
+            lang_style.apply_to(&m.language),
+            ver_style.apply_to(&m.version),
+            dim.apply_to(format!("[{}]", archs.join(", ")))
+        );
+    }
+    println!();
+    Ok(())
+}
+
+fn runtimes_install(
+    manager: &PackageManager,
+    language: &str,
+    version: &str,
+    arch: &str,
+) -> Result<()> {
+    let start = Instant::now();
+
+    // ── Header ─────────────────────────────────────────────────
+    println!();
+    println!(
+        "  {} Installing {} {}",
+        PACKAGE,
+        style(format!("{}:{}", language, version)).bold().cyan(),
+        style(format!("({})", arch)).dim()
+    );
+    println!("  {}", style("─".repeat(48)).dim());
+
+    // ── Step 1: Scan manifests ──────────────────────────────────
+    let spinner = make_spinner();
+    spinner.set_message(format!("{}Scanning manifests…", LOOKING_GLASS));
+
+    let resolver = manager.build_resolver()?;
+    let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
+        spinner.finish_with_message(format!(
+            "{}Manifest not found for {}:{}",
+            CROSS, language, version
+        ));
+        anyhow!("manifest not found for {language}:{version}")
+    })?;
+
+    let manifests = manager.scan_manifests()?;
+    let manifest = manifests
+        .into_iter()
+        .find(|m| m.language == language && m.version == resolved_version)
+        .ok_or_else(|| {
+            spinner.finish_with_message(format!(
+                "{}Manifest not found for resolved version {}:{}",
+                CROSS, language, resolved_version
+            ));
+            anyhow!("manifest not found for {language}:{resolved_version}")
+        })?;
+
+    spinner.finish_with_message(format!(
+        "{}Resolved {} to {} {}",
+        CHECKMARK,
+        style(version).dim(),
+        style(language).green(),
+        style(&resolved_version).yellow()
+    ));
+
+    // ── Step 2: Download ────────────────────────────────────────
+    let download_bar = make_download_bar();
+    download_bar.set_message(format!(
+        "{}Downloading {} {} archive…",
+        DOWNLOAD,
+        style(language).green(),
+        style(&resolved_version).yellow()
+    ));
+
+    let installed = manager.install_runtime_with_progress(&manifest, arch, &download_bar);
+
+    match installed {
+        Ok(path) => {
+            download_bar
+                .finish_with_message(format!("{}Download & extraction complete", CHECKMARK));
+
+            let elapsed = start.elapsed();
+
+            // ── Success summary ──────────────────────────────────
+            println!("  {}", style("─".repeat(48)).dim());
+            println!(
+                "  {}Runtime installed successfully in {:.1}s",
+                SPARKLE,
+                elapsed.as_secs_f64()
+            );
+            println!(
+                "  {}  {}",
+                style("→").cyan(),
+                style(path.display()).underlined().dim()
+            );
+            println!();
             Ok(())
         }
-        RuntimesSubcommands::Update { sources } => {
-            if sources.is_empty() {
-                bail!("at least one --source file_name=url is required");
-            }
-            let updated = manager.update_manifests(&sources)?;
-            for path in updated {
-                println!("updated manifest: {}", path.display());
-            }
-            Ok(())
+        Err(e) => {
+            download_bar.abandon_with_message(format!("{}Installation failed", CROSS));
+            println!("\n  {} {}\n", CROSS, style(format!("{e}")).red());
+            Err(e.into())
+        }
+    }
+}
+
+fn runtimes_update(manager: &PackageManager, target: UpdateTarget) -> Result<()> {
+    println!(
+        "\n  {} {}\n",
+        REFRESH,
+        style("Updating manifests…").bold().cyan()
+    );
+
+    let mut total = 0usize;
+
+    match target {
+        UpdateTarget::Java => {
+            total += run_updater(manager, &JavaCorrettoUpdater::default());
+        }
+        UpdateTarget::Python => {
+            total += run_updater(manager, &PythonStandaloneUpdater);
+        }
+        UpdateTarget::All => {
+            total += run_updater(manager, &JavaCorrettoUpdater::default());
+            total += run_updater(manager, &PythonStandaloneUpdater);
+        }
+    }
+
+    println!(
+        "\n  {} {}\n",
+        SPARKLE,
+        style(format!("Updated {total} manifest(s) total")).bold()
+    );
+    Ok(())
+}
+
+fn run_updater<U: jet_pack::RuntimeUpdater>(manager: &PackageManager, updater: &U) -> usize {
+    let spinner = make_spinner();
+    spinner.set_message(format!(
+        "{}Fetching latest {} versions…",
+        LOOKING_GLASS,
+        style(updater.language()).green()
+    ));
+
+    match manager.update_manifests_with_updater(updater) {
+        Ok(paths) => {
+            let count = paths.len();
+            spinner.finish_with_message(format!(
+                "{}Updated {} {} manifest(s)",
+                CHECKMARK,
+                style(count).bold(),
+                style(updater.language()).green()
+            ));
+            count
+        }
+        Err(e) => {
+            spinner.finish_with_message(format!(
+                "{}Failed to update {}: {}",
+                CROSS,
+                style(updater.language()).yellow(),
+                style(format!("{e}")).red()
+            ));
+            0
         }
     }
 }
@@ -620,21 +957,6 @@ fn build_job_request(
     })
 }
 
-fn parse_manifest_source(input: &str) -> Result<ManifestSource, String> {
-    let (file_name, url) = input
-        .split_once('=')
-        .ok_or_else(|| "expected format: file_name=url".to_string())?;
-
-    if file_name.trim().is_empty() || url.trim().is_empty() {
-        return Err("expected format: file_name=url".to_string());
-    }
-
-    Ok(ManifestSource {
-        file_name: file_name.trim().to_string(),
-        url: url.trim().to_string(),
-    })
-}
-
 fn parse_duration(input: &str) -> Result<Duration, String> {
     humantime::parse_duration(input).map_err(|e| e.to_string())
 }
@@ -656,12 +978,6 @@ mod tests {
     fn parse_duration_supports_fractional_seconds() {
         let d = parse_duration("0.5s").expect("duration should parse");
         assert_eq!(d, Duration::from_millis(500));
-    }
-
-    #[test]
-    fn parse_manifest_source_requires_key_value() {
-        let err = parse_manifest_source("bad-format").expect_err("should fail");
-        assert!(err.contains("expected format"));
     }
 
     #[test]

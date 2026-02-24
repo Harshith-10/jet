@@ -9,13 +9,13 @@ Status: Code Review Complete - Critical Issues Identified
 
 The Jet project is well-architected but has **4 critical security issues** and **6 medium/low priority issues** that must be addressed before production deployment. The most urgent is the missing namespace unsharing in the sandbox implementation.
 
-**Overall Security Assessment:** ✅ **Security Hardened - Production Ready (with Java caveats)**
+**Overall Security Assessment:** ⚠️ **Not Production Ready**
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| 🔴 Critical | 4 | ✅ Fixed / Validated |
-| 🟡 Medium | 4 | ✅ Fixed |
-| 🟢 Low | 6 | ✅ Fixed |
+| 🔴 Critical | 4 | Not Fixed |
+| 🟡 Medium | 4 | Not Fixed |
+| 🟢 Low | 6 | Not Fixed |
 
 ---
 
@@ -25,7 +25,7 @@ The Jet project is well-architected but has **4 critical security issues** and *
 
 **File:** [apps/jet-server/src/sandbox/container.rs](apps/jet-server/src/sandbox/container.rs#L50-L60)
 
-**Severity:** � FIXED (Stabilized)
+**Severity:** 🔴 CRITICAL
 
 **Description:**
 The sandbox only unshares 4 namespaces but the PLAN requires 7. The missing three are essential for isolation:
@@ -44,9 +44,11 @@ container
 // - PID namespace: Prevents containers from seeing each other's processes
 ```
 
-**Status:** ✅ FIXED (Stabilized)
-- Mount, PID, Cgroup, Ipc, Network, Uts namespaces enabled.
-- **Note:** User namespace is currently disabled to maintain compatibility with the Java Corretto runtime (which fails with 127/Permission Denied when mapped).
+**Security Impact:** HIGH
+- User code runs as the same user as the Jet worker process
+- User code can potentially see and interfere with parent process mounts
+- Multiple concurrent jobs can see each other's PIDs
+- Cross-job interference is possible
 
 **Required Fix:**
 ```rust
@@ -73,7 +75,7 @@ container
 
 **File:** [apps/jet-server/src/sandbox/container.rs](apps/jet-server/src/sandbox/container.rs#L22-L34) and [apps/jet-server/src/worker/evaluator.rs](apps/jet-server/src/worker/evaluator.rs#L113)
 
-**Severity:** � FIXED
+**Severity:** 🔴 CRITICAL
 
 **Description:**
 Two security profiles exist but only the insecure one is used:
@@ -100,9 +102,16 @@ pub fn portable() -> Self {
 }
 ```
 
-**Status:** ✅ FIXED
-Applied Strict profile across the evaluator. Defaulted to strict security settings including Landlock and Cgroups.
-**Note:** Seccomp is currently disabled for Java runtime compatibility but can be re-enabled for simpler runtimes (Python).
+**Current Usage:**
+```rust
+// apps/jet-server/src/worker/evaluator.rs - Line 113
+let mut sandbox = Sandbox::new(
+    &compile_limits,
+    &self.workspace_dir,
+    self.runtime_dir.as_deref(),
+    &SandboxProfile::portable(),  // ❌ ALWAYS PORTABLE
+)?;
+```
 
 **Security Impact:** CRITICAL
 - No cgroups: Resource limits (memory, CPU, pids) NOT enforced via OS
@@ -160,7 +169,7 @@ let mut sandbox = Sandbox::new(
 
 **File:** [crates/jet-pack/src/archive.rs](crates/jet-pack/src/archive.rs#L56-L90)
 
-**Severity:** � FIXED
+**Severity:** 🔴 CRITICAL
 
 **Description:**
 ZIP archive extraction uses `enclosed_name()` for basic protection but doesn't validate final paths:
@@ -287,7 +296,7 @@ cd /tmp/zip_test && zip -r -y runtime.zip ../../bad.txt
 
 **File:** [apps/jet-server/src/api.rs](apps/jet-server/src/api.rs#L48-L60)
 
-**Severity:** � FIXED
+**Severity:** 🔴 CRITICAL
 
 **Description:**
 The job submission endpoint has no request size limits or validation:
@@ -409,7 +418,7 @@ fn validate_job_request(req: &JobRequest) -> Result<(), (StatusCode, String)> {
 
 **File:** [apps/jet-server/src/sandbox/container.rs](apps/jet-server/src/sandbox/container.rs#L233)
 
-**Severity:** � FIXED
+**Severity:** 🟡 MEDIUM
 
 **Description:**
 Integer division truncates timeout values, causing inaccuracy:
@@ -452,7 +461,7 @@ fn timeout_rounding_is_correct() {
 
 **File:** [apps/jet-server/src/sandbox/container.rs](apps/jet-server/src/sandbox/container.rs#L293-L295)
 
-**Severity:** � FIXED
+**Severity:** 🟡 MEDIUM
 
 **Description:**
 Float to u64 conversion can lose sub-millisecond precision:
@@ -481,7 +490,7 @@ cpu_time = Some((total_ns / 1_000_000) as u64);  // Convert to ms
 
 **File:** [apps/jet-server/src/sandbox/container.rs](apps/jet-server/src/sandbox/container.rs#L284-L290)
 
-**Severity:** � FIXED
+**Severity:** 🟡 MEDIUM
 
 **Description:**
 Fragile string-based status detection depends on error message format:
@@ -550,7 +559,7 @@ fn detect_stage_status(
 
 **File:** [apps/jet-server/src/worker/evaluator.rs](apps/jet-server/src/worker/evaluator.rs#L13-L29)
 
-**Severity:** 🟡 FIXED
+**Severity:** 🟡 MEDIUM
 
 **Description:**
 JVM flags are hardcoded constants, preventing deployment-specific tuning:
@@ -604,18 +613,11 @@ pub struct JetConfig {
 }
 ```
 
-**Effort:**
-
+**Effort:** 
 - Option A: 1 hour (update updater, manifest struct, evaluator)
 - Option B: 30 minutes (config loading, passing through context)
 
 **Recommendation:** Option A (manifest-based) for per-language customization
-
-**Status:** ✅ FIXED
-- Added `jvm_flags` field to `ExecutionTemplate` in the manifest struct
-- Evaluator now reads flags from `compile.jvm_flags` / `execute.jvm_flags`
-- Default fallback constants still exist for manifests without the field
-- Java Corretto updater auto-populates JVM flags in generated manifests
 
 ---
 
@@ -623,23 +625,20 @@ pub struct JetConfig {
 
 ### 9. Missing Test Coverage for Failure Scenarios
 
-**Severity:** 🟢 FIXED
+**Severity:** 🟢 LOW
 
 **Description:**
 PLAN requirement: "Write tests for everything we build. Make sure all the tests pass before committing. The tests should not only test the working, but failure points too. Cover points like checking if TLE, MLE, OLE, Fork Bomb Prevention, Compile and Runtime Errors, all are correctly detected and parsed."
 
 **Current Status:**
-- ✅ 53 tests passing (8 unit + 21 jet-pack + 4 jet-cli + 8 jet-core + 12 integration)
+- ✅ 39 tests passing
 - ✅ Basic functionality tested
-- ✅ Memory Limit Exceeded tested
-- ✅ Output Limit Exceeded tested
-- ✅ Compilation errors tested
-- ✅ Fork bomb prevention tested
-- ✅ Concurrent job execution tested
-- ✅ Filesystem escape prevention tested
-- ✅ Network isolation tested
-- ✅ Exit code tracking tested
-- ✅ Stdin handling tested
+- ❌ Memory Limit Exceeded not tested
+- ❌ Output Limit Exceeded not tested
+- ❌ Compilation errors not tested
+- ❌ Fork bomb prevention not tested
+- ❌ Concurrent job execution not tested
+- ❌ Security boundary testing not done
 
 **Tests To Add:**
 ```rust
@@ -690,7 +689,7 @@ fn fork_bomb_prevented() {
 
 **File:** [apps/jet-server/src/sandbox/container.rs](apps/jet-server/src/sandbox/container.rs#L23)
 
-**Severity:** 🟢 FIXED
+**Severity:** 🟢 LOW
 
 **Description:**
 `SandboxProfile::strict()` is defined but never called, flagged as dead code.
@@ -707,7 +706,7 @@ fn fork_bomb_prevented() {
 
 **File:** [apps/jet-server/src/worker/runner.rs](apps/jet-server/src/worker/runner.rs#L110-L170)
 
-**Severity:** 🟢 FIXED
+**Severity:** 🟢 LOW
 
 **Description:**
 After a job completes, the workspace directory is never cleaned up:
@@ -785,21 +784,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **Effort:** 2 hours
 
-**Status:** ✅ FIXED
-
-- Added `tracing` and `tracing-subscriber` with `env-filter` support
-- Structured logging with contextual fields throughout:
-  - Startup: manifest count, cache key, bind address
-  - API: job submissions, validation rejections
-  - Worker: job start, completion (with duration), failure (with error), workspace cleanup warnings
-  - Shutdown: signal type, graceful shutdown initiated
-- Log level configurable via `RUST_LOG` env var (defaults to `info`)
-
 ---
 
 ### 13. No Graceful Shutdown
 
-**Severity:** 🟢 FIXED
+**Severity:** 🟢 LOW
 
 **Description:**
 Server doesn't handle graceful shutdown; kills in-flight jobs:
@@ -834,42 +823,44 @@ tokio::select! {
 
 | # | Issue | Severity | Component | Effort | Status |
 |---|-------|----------|-----------|--------|--------|
-| 1 | Missing namespace unsharing | 🔴 CRITICAL | sandbox/container.rs | 5m | ✅ Fixed |
-| 2 | Security profiles not enforced | 🔴 CRITICAL | sandbox/evaluator | 5m-30m | ✅ Fixed |
-| 3 | Path traversal in archives | 🔴 CRITICAL | jet-pack/archive.rs | 20m | ✅ Fixed |
-| 4 | No request validation/limits | 🔴 CRITICAL | jet-server/api.rs | 5m-15m | ✅ Fixed |
-| 5 | Timeout precision loss | 🟡 MEDIUM | sandbox/container.rs | 2m | ✅ Fixed |
-| 6 | CPU time precision loss | 🟡 MEDIUM | sandbox/container.rs | 5m | ✅ Fixed |
-| 7 | String-based status detection | 🟡 MEDIUM | sandbox/container.rs | 15m | ✅ Fixed |
-| 8 | Hardcoded JVM flags | 🟡 MEDIUM | worker/evaluator | 30m-1h | ✅ Fixed |
-| 9 | Missing test coverage | 🟡 MEDIUM | all | 4h | ✅ Fixed |
-| 10 | Dead code: `strict()` | 🟢 LOW | sandbox/container.rs | 1m | ✅ Fixed |
-| 11 | No workspace cleanup | 🟢 LOW | worker/runner | 15m | ✅ Fixed |
-| 12 | No logging/observability | 🟢 LOW | all | 2h | ✅ Fixed |
-| 13 | No graceful shutdown | 🟢 LOW | jet-server/main.rs | 1h | ✅ Fixed |
+| 1 | Missing namespace unsharing | 🔴 CRITICAL | sandbox/container.rs | 5m | ❌ Not Fixed |
+| 2 | Security profiles not enforced | 🔴 CRITICAL | sandbox/evaluator | 5m-30m | ❌ Not Fixed |
+| 3 | Path traversal in archives | 🔴 CRITICAL | jet-pack/archive.rs | 20m | ❌ Not Fixed |
+| 4 | No request validation/limits | 🔴 CRITICAL | jet-server/api.rs | 5m-15m | ❌ Not Fixed |
+| 5 | Timeout precision loss | 🟡 MEDIUM | sandbox/container.rs | 2m | ❌ Not Fixed |
+| 6 | CPU time precision loss | 🟡 MEDIUM | sandbox/container.rs | 5m | ❌ Not Fixed |
+| 7 | String-based status detection | 🟡 MEDIUM | sandbox/container.rs | 15m | ❌ Not Fixed |
+| 8 | Hardcoded JVM flags | 🟡 MEDIUM | worker/evaluator | 30m-1h | ❌ Not Fixed |
+| 9 | Missing test coverage | 🟡 MEDIUM | all | 4h | ❌ Not Fixed |
+| 10 | Dead code: `strict()` | 🟢 LOW | sandbox/container.rs | 1m | ❌ Not Fixed |
+| 11 | No workspace cleanup | 🟢 LOW | worker/runner | 15m | ❌ Not Fixed |
+| 12 | No logging/observability | 🟢 LOW | all | 2h | ❌ Not Fixed |
+| 13 | No graceful shutdown | 🟢 LOW | jet-server/main.rs | 1h | ❌ Not Fixed |
 
 ---
 
 ## Recommended Fix Priority
 
-### Phase 1: Critical Security Fixes (COMPLETED ✅)
-1. **Add missing namespaces** (User, Mount, PID) - FIXED (User namespace disabled for runtime compatibility)
-2. **Enable security profiles** - FIXED
-3. **Add request validation** - FIXED
-4. **Fix path traversal** - FIXED
+### Phase 1: Critical Security Fixes (MUST DO - 45 minutes)
+1. **Add missing namespaces** (User, Mount, PID) - 5 min
+2. **Enable security profiles** - 5 min
+3. **Add request validation** - 15 min
+4. **Fix path traversal** - 20 min
 
-### Phase 2: Reliability Fixes (COMPLETED ✅)
-5. Fix timeout precision - FIXED
-6. Fix CPU time precision - FIXED
-7. Remove dead code - FIXED
-8. Add workspace cleanup - FIXED
-9. Better status detection - FIXED
+**Status Check:** After Phase 1, run full test suite and security audit.
 
-### Phase 3: Quality Improvements (COMPLETED ✅)
-10. Add comprehensive test coverage - FIXED (12 new integration tests)
-11. Add logging/observability - FIXED (tracing with structured logging)
-12. Add graceful shutdown - FIXED
-13. Manifest-based JVM flags - FIXED
+### Phase 2: Reliability Fixes (SHOULD DO - 30 minutes)
+5. Fix timeout precision - 2 min
+6. Fix CPU time precision - 5 min
+7. Remove dead code - 1 min
+8. Add workspace cleanup - 15 min
+9. Better status detection - 15 min
+
+### Phase 3: Quality Improvements (NICE TO HAVE - 6+ hours)
+10. Add comprehensive test coverage - 4 hours
+11. Add logging/observability - 2 hours
+12. Add graceful shutdown - 1 hour
+13. Manifest-based JVM flags - 1 hour
 
 ---
 

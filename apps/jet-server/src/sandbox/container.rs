@@ -74,12 +74,20 @@ impl Sandbox {
             container.bindmount_ro(runtime, "/opt/runtime");
         }
 
+        // When cgroups are enabled, physical memory is enforced there.
+        // RLIMIT_AS caps *virtual* address space – JVM-based runtimes
+        // mmap large reserved (but uncommitted) regions for compressed
+        // class space, code cache, metaspace, etc. so we allow 4x the
+        // physical limit for virtual space.  Without cgroups, RLIMIT_AS
+        // is the only memory backstop, so we keep it at the actual limit.
+        let rlimit_as = if profile.enable_cgroups {
+            limits.memory_limit_bytes.saturating_mul(4)
+        } else {
+            limits.memory_limit_bytes
+        };
+
         container
-            .setrlimit(
-                Rlimit::As,
-                limits.memory_limit_bytes,
-                limits.memory_limit_bytes,
-            )
+            .setrlimit(Rlimit::As, rlimit_as, rlimit_as)
             .setrlimit(Rlimit::Core, 0, 0)
             .setrlimit(
                 Rlimit::Fsize,

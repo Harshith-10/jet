@@ -207,6 +207,12 @@ pub fn build_version_map(manifests: &[RuntimeManifest]) -> JetPackResult<HashMap
                     .or_insert_with(|| full.clone());
             }
         }
+
+        // Add 'latest' as a default alias for the highest version
+        if let Some((_, manifest)) = versions.first() {
+            map.entry(format!("{}:{}", language, "latest"))
+                .or_insert_with(|| manifest.version.clone());
+        }
     }
 
     Ok(map)

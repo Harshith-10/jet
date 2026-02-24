@@ -3,9 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use indicatif::ProgressBar;
+
 use crate::{
     archive::extract_archive,
-    downloader::download_to_path,
+    downloader::{download_to_path, download_to_path_with_progress},
     error::{JetPackError, JetPackResult},
     manifest::RuntimeManifest,
     resolver::{InMemoryVersionStore, VersionResolver, scan_manifest_dir},
@@ -96,6 +98,68 @@ impl PackageManager {
         let extracted_path = target_dir.join("root");
         extract_archive(&archive_path, &extracted_path)?;
         flatten_single_top_level_dir(&extracted_path)?;
+
+        Ok(extracted_path)
+    }
+
+    /// Like `install_runtime` but reports download progress to an `indicatif::ProgressBar`.
+    pub fn install_runtime_with_progress(
+        &self,
+        manifest: &RuntimeManifest,
+        arch: &str,
+        download_progress: &ProgressBar,
+    ) -> JetPackResult<PathBuf> {
+        let archive = manifest
+            .runtimes
+            .get(arch)
+            .ok_or_else(|| JetPackError::MissingArchive {
+                language: manifest.language.clone(),
+                version: manifest.version.clone(),
+                arch: arch.to_string(),
+            })?;
+
+        fs::create_dir_all(&self.runtime_dir).map_err(|source| JetPackError::Io {
+            path: self.runtime_dir.clone(),
+            source,
+        })?;
+
+        if manifest.language == "java" {
+            remove_old_java_major_installs(&self.runtime_dir, &manifest.version)?;
+        }
+
+        let target_dir = self
+            .runtime_dir
+            .join(&manifest.language)
+            .join(&manifest.version);
+
+        if target_dir.exists() {
+            fs::remove_dir_all(&target_dir).map_err(|source| JetPackError::Io {
+                path: target_dir.clone(),
+                source,
+            })?;
+        }
+
+        fs::create_dir_all(&target_dir).map_err(|source| JetPackError::Io {
+            path: target_dir.clone(),
+            source,
+        })?;
+
+        let file_name = archive
+            .url
+            .split('/')
+            .next_back()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("runtime.tar.gz");
+
+        let archive_path = target_dir.join(file_name);
+        download_to_path_with_progress(&archive.url, &archive_path, download_progress)?;
+
+        let extracted_path = target_dir.join("root");
+        extract_archive(&archive_path, &extracted_path)?;
+        flatten_single_top_level_dir(&extracted_path)?;
+
+        // Clean up archive to save disk space
+        let _ = fs::remove_file(&archive_path);
 
         Ok(extracted_path)
     }

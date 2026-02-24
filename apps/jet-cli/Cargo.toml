@@ -6,14 +6,21 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.60", features = ["derive"] }
+console = "0.15"
 futures = "0.3.32"
 humantime = "2.3.0"
+indicatif = "0.17"
 jet-core = { path = "../../crates/jet-core" }
 jet-pack = { path = "../../crates/jet-pack" }
 reqwest = { version = "0.12.28", features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.49.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+] }
 
 [dev-dependencies]
 tempfile = "3.25.0"
