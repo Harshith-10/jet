@@ -185,10 +185,28 @@ pub fn parse_corretto_release_manifest(
         compile: Some(ExecutionTemplate {
             command: "/opt/runtime/bin/javac".to_string(),
             args: Some(vec!["{file}".to_string()]),
+            jvm_flags: Some(vec![
+                "-Xms16m".to_string(),
+                "-Xmx256m".to_string(),
+                "-XX:MaxMetaspaceSize=64m".to_string(),
+                "-XX:CompressedClassSpaceSize=32m".to_string(),
+                "-XX:ReservedCodeCacheSize=32m".to_string(),
+                "-XX:+UseSerialGC".to_string(),
+                "-Xss256k".to_string(),
+            ]),
         }),
         execute: ExecutionTemplate {
             command: "/opt/runtime/bin/java".to_string(),
             args: Some(vec!["-cp".to_string(), ".".to_string(), "Main".to_string()]),
+            jvm_flags: Some(vec![
+                "-Xms8m".to_string(),
+                "-Xmx64m".to_string(),
+                "-XX:MaxMetaspaceSize=32m".to_string(),
+                "-XX:CompressedClassSpaceSize=16m".to_string(),
+                "-XX:ReservedCodeCacheSize=16m".to_string(),
+                "-XX:+UseSerialGC".to_string(),
+                "-Xss256k".to_string(),
+            ]),
         },
     })
 }
@@ -308,6 +326,7 @@ pub fn parse_python_release_manifests(release: &Value) -> JetPackResult<Vec<Upda
             execute: ExecutionTemplate {
                 command: "/opt/runtime/bin/python3".to_string(),
                 args: Some(vec!["{file}".to_string()]),
+                jvm_flags: None,
             },
         };
 

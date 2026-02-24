@@ -340,6 +340,7 @@ mod tests {
             execute: ExecutionTemplate {
                 command: "run".to_string(),
                 args: None,
+                jvm_flags: None,
             },
             compile: None,
         }

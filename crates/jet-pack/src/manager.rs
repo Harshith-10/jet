@@ -285,6 +285,7 @@ mod tests {
                     execute: ExecutionTemplate {
                         command: "python3".to_string(),
                         args: Some(vec!["{file}".to_string()]),
+                        jvm_flags: None,
                     },
                 },
             }])
@@ -309,6 +310,7 @@ mod tests {
             execute: ExecutionTemplate {
                 command: "python".to_string(),
                 args: Some(vec!["main.py".to_string()]),
+                jvm_flags: None,
             },
             compile: None,
         }

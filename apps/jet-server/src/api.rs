@@ -12,6 +12,7 @@ use jet_core::models::JobRequest;
 use jet_pack::{RedisVersionStore, VersionResolver, manifest::RuntimeManifest};
 use redis::{AsyncCommands, aio::ConnectionManager};
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::queue::{JobStateRecord, QueuedJob, job_state_key};
@@ -28,6 +29,61 @@ pub struct ApiState {
     pub storage: SharedStorage,
     pub redis_conn: SharedRedisConn,
     pub job_state_prefix: String,
+}
+
+const MAX_FILES: usize = 100;
+const MAX_TESTCASES: usize = 1000;
+const MAX_TOTAL_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+
+fn validate_job_request(req: &JobRequest) -> Result<(), (StatusCode, String)> {
+    if req.files.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "at least one file is required".to_string(),
+        ));
+    }
+
+    if req.files.len() > MAX_FILES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many files: {} (max: {})", req.files.len(), MAX_FILES),
+        ));
+    }
+
+    let total_size: usize = req.files.iter().map(|f| f.content.len()).sum();
+    if total_size > MAX_TOTAL_FILE_SIZE {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "total file size too large: {} bytes (max: {})",
+                total_size, MAX_TOTAL_FILE_SIZE
+            ),
+        ));
+    }
+
+    if let Some(testcases) = &req.testcases {
+        if testcases.len() > MAX_TESTCASES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "too many testcases: {} (max: {})",
+                    testcases.len(),
+                    MAX_TESTCASES
+                ),
+            ));
+        }
+
+        for (i, tc) in testcases.iter().enumerate() {
+            if tc.input.len() > MAX_TOTAL_FILE_SIZE / 10 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("testcase {} input too large", i),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -53,6 +109,11 @@ async fn submit_job(
     State(state): State<ApiState>,
     Json(mut request): Json<JobRequest>,
 ) -> Result<(StatusCode, Json<SubmitJobResponse>), (StatusCode, String)> {
+    validate_job_request(&request).map_err(|e| {
+        warn!(language = %request.language, reason = %e.1, "job submission rejected: validation");
+        e
+    })?;
+
     let requested = request
         .version
         .clone()
@@ -119,6 +180,13 @@ async fn submit_job(
         .set::<String, String, ()>(state_key, payload)
         .await
         .map_err(internal_error)?;
+
+    info!(
+        job_id = %job_id,
+        language = %queued_state.language,
+        version = %resolved,
+        "job submitted"
+    );
 
     Ok((
         StatusCode::ACCEPTED,

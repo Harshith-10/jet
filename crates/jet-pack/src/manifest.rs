@@ -14,6 +14,8 @@ pub struct RuntimeArchive {
 pub struct ExecutionTemplate {
     pub command: String,
     pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub jvm_flags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

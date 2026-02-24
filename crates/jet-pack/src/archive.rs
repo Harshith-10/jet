@@ -39,12 +39,53 @@ fn extract_tar_gz(archive_path: &Path, destination: &Path) -> JetPackResult<()> 
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
 
-    archive
-        .unpack(destination)
+    let canonical_dest = destination
+        .canonicalize()
         .map_err(|source| JetPackError::Io {
             path: destination.to_path_buf(),
             source,
         })?;
+
+    for entry in archive.entries().map_err(|source| JetPackError::Io {
+        path: archive_path.to_path_buf(),
+        source,
+    })? {
+        let mut entry = entry.map_err(|source| JetPackError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+
+        let path = entry.path().map_err(|source| JetPackError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+
+        let output_path = canonical_dest.join(path);
+        // Ensure no path traversal
+        if !output_path.starts_with(&canonical_dest) {
+            return Err(JetPackError::Io {
+                path: output_path,
+                source: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path traversal detected in tar archive",
+                ),
+            });
+        }
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| JetPackError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        entry
+            .unpack(&output_path)
+            .map_err(|source| JetPackError::Io {
+                path: output_path,
+                source,
+            })?;
+    }
 
     Ok(())
 }
@@ -60,6 +101,13 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> JetPackResult<()> {
         source: io::Error::other(source.to_string()),
     })?;
 
+    let canonical_dest = destination
+        .canonicalize()
+        .map_err(|source| JetPackError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+
     for index in 0..archive.len() {
         let mut zipped = archive.by_index(index).map_err(|source| JetPackError::Io {
             path: archive_path.to_path_buf(),
@@ -70,7 +118,18 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> JetPackResult<()> {
             continue;
         };
 
-        let output_path = destination.join(enclosed_path);
+        let output_path = canonical_dest.join(enclosed_path);
+
+        // Double check path traversal even with enclosed_name()
+        if !output_path.starts_with(&canonical_dest) {
+            return Err(JetPackError::Io {
+                path: output_path,
+                source: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path traversal detected in zip archive",
+                ),
+            });
+        }
 
         if zipped.is_dir() {
             fs::create_dir_all(&output_path).map_err(|source| JetPackError::Io {

@@ -10,8 +10,8 @@ const DEFAULT_COMPILE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_JVM_COMPILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_JVM_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
-/// JVM flags passed as `-J<flag>` to javac during compilation.
-const JAVA_COMPILE_JVM_FLAGS: &[&str] = &[
+/// Fallback JVM flags used when the manifest does not specify `jvm_flags`.
+const DEFAULT_JAVA_COMPILE_JVM_FLAGS: &[&str] = &[
     "-Xms16m",
     "-Xmx256m",
     "-XX:MaxMetaspaceSize=64m",
@@ -21,8 +21,8 @@ const JAVA_COMPILE_JVM_FLAGS: &[&str] = &[
     "-Xss256k",
 ];
 
-/// JVM flags passed directly to java during execution.
-const JAVA_RUN_JVM_FLAGS: &[&str] = &[
+/// Fallback JVM flags used when the manifest does not specify `jvm_flags`.
+const DEFAULT_JAVA_RUN_JVM_FLAGS: &[&str] = &[
     "-Xms8m",
     "-Xmx64m",
     "-XX:MaxMetaspaceSize=32m",
@@ -77,11 +77,9 @@ impl Evaluator {
             } else {
                 DEFAULT_COMPILE_MEMORY_BYTES
             };
-            compile_limits.memory_limit_bytes = request.compile_memory_limit.unwrap_or_else(|| {
-                compile_limits
-                    .memory_limit_bytes
-                    .max(default_compile_mem)
-            });
+            compile_limits.memory_limit_bytes = request
+                .compile_memory_limit
+                .unwrap_or_else(|| compile_limits.memory_limit_bytes.max(default_compile_mem));
             if let Some(output_limit) = request.compile_output_limit {
                 compile_limits.output_limit_bytes = output_limit;
             }
@@ -93,7 +91,7 @@ impl Evaluator {
                 &compile_limits,
                 &self.workspace_dir,
                 self.runtime_dir.as_deref(),
-                &SandboxProfile::portable(),
+                &SandboxProfile::strict(),
             )?;
 
             let cmd = &compile_template.command;
@@ -111,10 +109,12 @@ impl Evaluator {
             // For javac, JVM flags must be prefixed with -J to avoid the
             // "Picked up JAVA_TOOL_OPTIONS" stderr noise.
             let java_compile_flags: Vec<String> = if self.manifest.language == "java" {
-                JAVA_COMPILE_JVM_FLAGS
-                    .iter()
-                    .map(|f| format!("-J{f}"))
-                    .collect()
+                let flags: Vec<&str> = compile_template
+                    .jvm_flags
+                    .as_ref()
+                    .map(|v| v.iter().map(|s| s.as_str()).collect())
+                    .unwrap_or_else(|| DEFAULT_JAVA_COMPILE_JVM_FLAGS.to_vec());
+                flags.iter().map(|f| format!("-J{f}")).collect()
             } else {
                 Vec::new()
             };
@@ -158,8 +158,9 @@ impl Evaluator {
 
         // JVM needs at least ~512 MB of virtual address space to start.
         if self.manifest.language == "java" {
-            run_limits.memory_limit_bytes =
-                run_limits.memory_limit_bytes.max(DEFAULT_JVM_RUN_MEMORY_BYTES);
+            run_limits.memory_limit_bytes = run_limits
+                .memory_limit_bytes
+                .max(DEFAULT_JVM_RUN_MEMORY_BYTES);
         }
 
         let cmd = &self.manifest.execute.command;
@@ -178,11 +179,22 @@ impl Evaluator {
 
         // For java, pass JVM flags as direct CLI args (before the class name)
         // to avoid the "Picked up JAVA_TOOL_OPTIONS" stderr noise.
-        let mut full_run_args: Vec<&str> = if self.manifest.language == "java" {
-            JAVA_RUN_JVM_FLAGS.to_vec()
+        let run_jvm_flags_owned: Vec<String> = if self.manifest.language == "java" {
+            self.manifest
+                .execute
+                .jvm_flags
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| {
+                    DEFAULT_JAVA_RUN_JVM_FLAGS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                })
         } else {
             Vec::new()
         };
+        let mut full_run_args: Vec<&str> = run_jvm_flags_owned.iter().map(|s| s.as_str()).collect();
         full_run_args.extend_from_slice(&run_args);
 
         let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin")];
@@ -195,7 +207,7 @@ impl Evaluator {
                     &run_limits,
                     &self.workspace_dir,
                     self.runtime_dir.as_deref(),
-                    &SandboxProfile::portable(),
+                    &SandboxProfile::strict(),
                 )?;
                 let result =
                     sandbox.run(cmd, &full_run_args, Some(&envs), Some(&tc.input), timeout)?;
@@ -223,7 +235,7 @@ impl Evaluator {
                 &run_limits,
                 &self.workspace_dir,
                 self.runtime_dir.as_deref(),
-                &SandboxProfile::portable(),
+                &SandboxProfile::strict(),
             )?;
             let result = sandbox.run(
                 cmd,

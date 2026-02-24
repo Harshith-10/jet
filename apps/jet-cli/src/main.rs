@@ -46,7 +46,7 @@ struct ExecArgs {
     #[arg(long = "stdin")]
     stdin_file: Option<PathBuf>,
 
-    #[arg(long = "server", default_value = "http://127.0.0.1:3000")]
+    #[arg(long = "server", default_value = "http://127.0.0.1:4000")]
     server: String,
 
     #[arg(long = "poll-interval", value_parser = parse_duration, default_value = "200ms")]
@@ -96,7 +96,7 @@ struct BenchmarkArgs {
     #[arg(long = "stdin")]
     stdin_file: Option<PathBuf>,
 
-    #[arg(long = "server", default_value = "http://127.0.0.1:3000")]
+    #[arg(long = "server", default_value = "http://127.0.0.1:4000")]
     server: String,
 
     #[arg(long = "poll-interval", value_parser = parse_duration, default_value = "200ms")]

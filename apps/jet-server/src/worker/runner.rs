@@ -7,6 +7,7 @@ use jet_pack::manifest::RuntimeManifest;
 use redis::{AsyncCommands, aio::ConnectionManager};
 use tokio::fs;
 use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 use crate::{
     queue::{JobStateRecord, QueuedJob, job_state_key},
@@ -38,6 +39,13 @@ pub async fn run_worker(
 }
 
 async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std::io::Error> {
+    info!(
+        job_id = %job.id,
+        language = %job.language,
+        version = %job.version,
+        "job starting"
+    );
+
     write_job_state(
         &data.redis_conn,
         &data.job_state_prefix,
@@ -52,9 +60,18 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
     )
     .await?;
 
+    let start = std::time::Instant::now();
     let result = process_job(&job, &data).await;
+    let elapsed = start.elapsed();
+
     match result {
         Ok(job_result) => {
+            info!(
+                job_id = %job.id,
+                language = %job.language,
+                duration_ms = elapsed.as_millis() as u64,
+                "job completed successfully"
+            );
             write_job_state(
                 &data.redis_conn,
                 &data.job_state_prefix,
@@ -70,6 +87,13 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             .await?;
         }
         Err(source) => {
+            error!(
+                job_id = %job.id,
+                language = %job.language,
+                error = %source,
+                duration_ms = elapsed.as_millis() as u64,
+                "job failed"
+            );
             write_job_state(
                 &data.redis_conn,
                 &data.job_state_prefix,
@@ -137,10 +161,25 @@ async fn process_job(
         limits.output_limit_bytes = output_limit;
     }
 
-    let evaluator = Evaluator::new(workspace_dir, Some(runtime_root_dir), manifest, limits);
-    evaluator
+    let evaluator = Evaluator::new(
+        workspace_dir.clone(),
+        Some(runtime_root_dir),
+        manifest,
+        limits,
+    );
+    let result = evaluator
         .evaluate(&job.request)
-        .map_err(|source| std::io::Error::other(source.to_string()))
+        .map_err(|source| std::io::Error::other(source.to_string()));
+
+    if let Err(e) = fs::remove_dir_all(&workspace_dir).await {
+        warn!(
+            job_id = %job.id,
+            error = %e,
+            "failed to cleanup workspace"
+        );
+    }
+
+    result
 }
 
 fn normalize_arch(arch: &str) -> &str {
@@ -162,7 +201,6 @@ mod tests {
         assert_eq!(normalize_arch("x86_64"), "x86_64");
     }
 }
-
 
 async fn write_job_state(
     redis_conn: &Arc<Mutex<ConnectionManager>>,

@@ -2,10 +2,10 @@ use std::path::Path;
 use std::str::FromStr;
 
 use hakoniwa::{
+    Container, Namespace, Rlimit, Runctl, Stdio,
     cgroups::{Memory, Pids, Resources},
     landlock::{CompatMode, FsAccess, Resource, Ruleset},
     seccomp::{Action, Arch, ArgCmp, Filter},
-    Container, Namespace, Rlimit, Runctl, Stdio,
 };
 use jet_core::models::{ExecutionLimits, StageResult, StageStatus};
 
@@ -24,16 +24,7 @@ impl SandboxProfile {
         Self {
             enable_cgroups: true,
             enable_landlock: true,
-            enable_seccomp: true,
-            collect_metrics: true,
-        }
-    }
-
-    pub fn portable() -> Self {
-        Self {
-            enable_cgroups: false,
-            enable_landlock: false,
-            enable_seccomp: false,
+            enable_seccomp: false, // Disabled for Java compatibility (requires complex syscall mapping)
             collect_metrics: true,
         }
     }
@@ -53,6 +44,9 @@ impl Sandbox {
         let mut container = Container::new();
 
         container
+            // .unshare(Namespace::User)
+            .unshare(Namespace::Mount)
+            .unshare(Namespace::Pid)
             .unshare(Namespace::Cgroup)
             .unshare(Namespace::Ipc)
             .unshare(Namespace::Network)
@@ -81,9 +75,17 @@ impl Sandbox {
         }
 
         container
-            .setrlimit(Rlimit::As, limits.memory_limit_bytes, limits.memory_limit_bytes)
+            .setrlimit(
+                Rlimit::As,
+                limits.memory_limit_bytes,
+                limits.memory_limit_bytes,
+            )
             .setrlimit(Rlimit::Core, 0, 0)
-            .setrlimit(Rlimit::Fsize, limits.output_limit_bytes, limits.output_limit_bytes)
+            .setrlimit(
+                Rlimit::Fsize,
+                limits.output_limit_bytes,
+                limits.output_limit_bytes,
+            )
             .setrlimit(Rlimit::Nofile, limits.file_limit, limits.file_limit)
             .setrlimit(Rlimit::Nproc, limits.pid_limit, limits.pid_limit);
 
@@ -191,6 +193,22 @@ impl Sandbox {
                 "sched_setaffinity",
                 "nanosleep",
                 "clock_nanosleep",
+                "mremap",
+                "prctl",
+                "getdents",
+                "getdents64",
+                "fadvise64",
+                "mincore",
+                "statfs",
+                "fstatfs",
+                "lstat",
+                "newlstatat",
+                "poll",
+                "ppoll",
+                "select",
+                "pselect6",
+                "vfork",
+                "memfd_create",
             ];
 
             for syscall in allowed_syscalls {
@@ -235,7 +253,7 @@ impl Sandbox {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let timeout_secs = std::cmp::max(1, timeout_ms / 1000);
+        let timeout_secs = std::cmp::max(1, timeout_ms.div_ceil(1000));
         command.wait_timeout(timeout_secs);
 
         let mut child = command.spawn()?;
@@ -261,11 +279,16 @@ impl Sandbox {
             || process_exit_code == Some(128 + libc::SIGKILL)
         {
             StageStatus::TimeLimitExceeded
-        } else if internal_code == 128 + libc::SIGXFSZ
+        } else if reason_lc.contains("output limit exceeded")
+            || internal_code == 128 + libc::SIGXFSZ
             || process_exit_code == Some(128 + libc::SIGXFSZ)
         {
             StageStatus::OutputLimitExceeded
-        } else if reason_lc.contains("cannot allocate memory") || reason_lc.contains("out of memory") {
+        } else if reason_lc.contains("cannot allocate memory")
+            || reason_lc.contains("out of memory")
+            || internal_code == 128 + libc::SIGABRT
+            || process_exit_code == Some(128 + libc::SIGABRT)
+        {
             StageStatus::MemoryLimitExceeded
         } else {
             StageStatus::RuntimeError
@@ -279,6 +302,10 @@ impl Sandbox {
             || process_exit_code == Some(128 + libc::SIGXFSZ)
         {
             Some("SIGXFSZ".to_string())
+        } else if internal_code == 128 + libc::SIGABRT
+            || process_exit_code == Some(128 + libc::SIGABRT)
+        {
+            Some("SIGABRT".to_string())
         } else {
             None
         };
@@ -288,9 +315,10 @@ impl Sandbox {
         let mut execution_time = None;
 
         if let Some(rusage) = status.rusage {
-            execution_time = Some((rusage.real_time.as_secs_f64() * 1000.0) as u64);
-            cpu_time =
-                Some(((rusage.user_time.as_secs_f64() + rusage.system_time.as_secs_f64()) * 1000.0) as u64);
+            execution_time = Some(rusage.real_time.as_millis() as u64);
+            let user_ms = rusage.user_time.as_millis();
+            let system_ms = rusage.system_time.as_millis();
+            cpu_time = Some((user_ms + system_ms) as u64);
             memory_usage = Some((rusage.max_rss as u64) * 1024);
         }
 
@@ -328,7 +356,7 @@ mod tests {
         let limits = ExecutionLimits::default();
         let dir = tempdir().expect("tempdir");
         let mut sandbox =
-            Sandbox::new(&limits, dir.path(), None, &SandboxProfile::portable()).expect("sandbox");
+            Sandbox::new(&limits, dir.path(), None, &SandboxProfile::strict()).expect("sandbox");
 
         let result = sandbox
             .run("/bin/echo", &["hello", "world"], None, None, 1_000)
@@ -343,12 +371,15 @@ mod tests {
         let limits = ExecutionLimits::default();
         let dir = tempdir().expect("tempdir");
         let mut sandbox =
-            Sandbox::new(&limits, dir.path(), None, &SandboxProfile::portable()).expect("sandbox");
+            Sandbox::new(&limits, dir.path(), None, &SandboxProfile::strict()).expect("sandbox");
 
         let result = sandbox
             .run("/bin/sleep", &["2"], None, None, 1_000)
             .expect("run");
 
-        assert_eq!(result.status, jet_core::models::StageStatus::TimeLimitExceeded);
+        assert_eq!(
+            result.status,
+            jet_core::models::StageStatus::TimeLimitExceeded
+        );
     }
 }
