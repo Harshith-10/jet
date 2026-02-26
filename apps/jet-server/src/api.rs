@@ -19,7 +19,9 @@ use deadpool_redis::{Pool, redis::AsyncCommands};
 use jet_core::models::JobRequest;
 use jet_pack::{RedisVersionStore, VersionResolver, manifest::RuntimeManifest};
 use serde::Serialize;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -43,11 +45,19 @@ pub struct ApiState {
     pub worker_concurrency: usize,
     pub jobs_in_flight: Arc<AtomicU64>,
     pub max_queue_depth: u64,
+    /// Per-category in-flight counters for MLP stats.
+    pub compile_in_flight: Arc<AtomicU64>,
+    pub execute_in_flight: Arc<AtomicU64>,
+    /// Concurrency limits for stats reporting.
+    pub compile_concurrency: usize,
+    pub execute_concurrency: usize,
+    /// Max queue wait time before shedding (seconds).
+    pub max_queue_wait_secs: u64,
 }
 
-const MAX_FILES: usize = 100;
+const MAX_FILES: usize = 10;
 const MAX_TESTCASES: usize = 1000;
-const MAX_TOTAL_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+const MAX_TOTAL_FILE_SIZE: usize = 5 * 1024 * 1024; // 5 MB
 
 /// TTL for job state keys set from the API side.
 const JOB_STATE_TTL_SECS: i64 = 3600; // 1 hour
@@ -131,39 +141,79 @@ pub struct StatsResponse {
     pub jobs_completed: u64,
     pub jobs_failed: u64,
     pub jobs_in_flight: u64,
+    pub compile_in_flight: u64,
+    pub execute_in_flight: u64,
     pub max_queue_depth: u64,
     pub installed_runtimes: usize,
     pub supported_languages: Vec<String>,
     pub worker_concurrency: usize,
+    pub compile_concurrency: usize,
+    pub execute_concurrency: usize,
+    pub max_queue_wait_secs: u64,
     pub host_arch: String,
 }
 
 pub fn router(state: ApiState) -> Router {
-    // Rate limiting: 10 requests per second per IP, burst of 30.
-    let governor_conf = GovernorConfigBuilder::default()
-        .per_second(10)
-        .burst_size(30)
+    // Strict Rate limiting: 1 request per second per IP, burst of 3.
+    // Uses SmartIpKeyExtractor to respect X-Forwarded-For / X-Real-IP
+    // headers from reverse proxies.
+    //
+    // NOTE: GovernorConfigBuilder::per_second(n) means "replenish 1 token
+    // every n seconds", NOT "n tokens per second".
+    let strict_conf = GovernorConfigBuilder::default()
+        .per_second(1)
+        .burst_size(3)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
 
     // Background cleanup of expired rate-limit entries.
-    let governor_limiter = governor_conf.limiter().clone();
+    let strict_limiter = strict_conf.limiter().clone();
     let interval = Duration::from_secs(60);
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(interval);
-            governor_limiter.retain_recent();
+            strict_limiter.retain_recent();
         }
     });
 
-    Router::new()
+    // General Rate limiting: 5 requests per second per IP, burst of 10.
+    // per_millisecond(200) = 1 token every 200ms = 5 tokens/second.
+    let general_conf = GovernorConfigBuilder::default()
+        .per_millisecond(200)
+        .burst_size(10)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .unwrap();
+
+    // Background cleanup of expired rate-limit entries.
+    let general_limiter = general_conf.limiter().clone();
+    let interval = Duration::from_secs(60);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(interval);
+            general_limiter.retain_recent();
+        }
+    });
+
+    // Define the "General" routes
+    let general_routes = Router::new()
         .route("/health", get(health))
-        .route("/jobs", post(submit_job))
         .route("/jobs/{id}", get(get_job))
         .route("/runtimes", get(list_runtimes))
         .route("/runtimes/{language}", get(get_language_runtimes))
         .route("/stats", get(get_stats))
-        .layer(GovernorLayer::new(governor_conf))
+        .layer(GovernorLayer::new(general_conf));
+
+    // Define the "Strict" routes
+    let strict_routes = Router::new()
+        .route("/jobs", post(submit_job))
+        .layer(GovernorLayer::new(strict_conf));
+
+    // Merge them together
+    Router::new()
+        .merge(general_routes)
+        .merge(strict_routes)
         .with_state(state)
 }
 
@@ -184,7 +234,7 @@ async fn submit_job(
             "rejecting job: queue full"
         );
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "server is overloaded: {} jobs in flight (max: {})",
                 in_flight, state.max_queue_depth
@@ -215,12 +265,17 @@ async fn submit_job(
         ))?;
 
     let manifest_key = format!("{}:{}", request.language, resolved);
-    if !state.manifests.contains_key(&manifest_key) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("runtime is not installed: {}", manifest_key),
-        ));
-    }
+    let manifest = state.manifests.get(&manifest_key).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("runtime is not installed: {}", manifest_key),
+    ))?;
+
+    // Determine job type based on whether the runtime has a compile step.
+    let job_type = if manifest.compile.is_some() {
+        crate::queue::JobType::Compile
+    } else {
+        crate::queue::JobType::Execute
+    };
 
     let job_id = request
         .job_id
@@ -230,11 +285,18 @@ async fn submit_job(
     request.job_id = Some(job_id.clone());
     request.version = Some(resolved.clone());
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     let job = QueuedJob {
         id: job_id.clone(),
         language: language.clone(),
         version: resolved.clone(),
         request,
+        enqueued_at: now_ms,
+        job_type,
     };
 
     state
@@ -255,6 +317,7 @@ async fn submit_job(
         version: resolved.clone(),
         result: None,
         error: None,
+        queue_wait_ms: None,
     };
 
     let state_key = job_state_key(&state.job_state_prefix, &job_id);
@@ -356,10 +419,15 @@ async fn get_stats(State(state): State<ApiState>) -> Json<StatsResponse> {
         jobs_completed: state.jobs_completed.load(Ordering::Relaxed),
         jobs_failed: state.jobs_failed.load(Ordering::Relaxed),
         jobs_in_flight: state.jobs_in_flight.load(Ordering::Relaxed),
+        compile_in_flight: state.compile_in_flight.load(Ordering::Relaxed),
+        execute_in_flight: state.execute_in_flight.load(Ordering::Relaxed),
         max_queue_depth: state.max_queue_depth,
         installed_runtimes: state.manifests.len(),
         supported_languages: langs,
         worker_concurrency: state.worker_concurrency,
+        compile_concurrency: state.compile_concurrency,
+        execute_concurrency: state.execute_concurrency,
+        max_queue_wait_secs: state.max_queue_wait_secs,
         host_arch: std::env::consts::ARCH.to_string(),
     })
 }
@@ -448,6 +516,11 @@ mod tests {
             worker_concurrency: 1,
             jobs_in_flight: Arc::new(AtomicU64::new(0)),
             max_queue_depth: 100,
+            compile_in_flight: Arc::new(AtomicU64::new(0)),
+            execute_in_flight: Arc::new(AtomicU64::new(0)),
+            compile_concurrency: 1,
+            execute_concurrency: 1,
+            max_queue_wait_secs: 30,
         };
 
         (state, shutdown_tx)
@@ -464,6 +537,7 @@ mod tests {
             version: "3.14.3".to_string(),
             result: None,
             error: None,
+            queue_wait_ms: None,
         };
         let payload = serde_json::to_string(&record).expect("serialize record");
         let key = job_state_key(&state.job_state_prefix, &record.job_id);

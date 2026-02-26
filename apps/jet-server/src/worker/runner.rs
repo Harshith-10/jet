@@ -7,10 +7,11 @@ use deadpool_redis::{Pool, redis::AsyncCommands};
 use jet_core::models::ExecutionLimits;
 use jet_pack::manifest::RuntimeManifest;
 use tokio::fs;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::{
-    queue::{JobStateRecord, QueuedJob, job_state_key},
+    queue::{JobStateRecord, JobType, QueuedJob, job_state_key},
     worker::evaluator::Evaluator,
 };
 
@@ -23,6 +24,15 @@ pub struct WorkerContext {
     pub jobs_completed: Arc<AtomicU64>,
     pub jobs_failed: Arc<AtomicU64>,
     pub jobs_in_flight: Arc<AtomicU64>,
+    /// Semaphore that gates compilation jobs (heavy, multi-threaded).
+    pub compile_semaphore: Arc<Semaphore>,
+    /// Semaphore that gates execution jobs (lightweight).
+    pub execute_semaphore: Arc<Semaphore>,
+    /// Per-category in-flight counters for observability.
+    pub compile_in_flight: Arc<AtomicU64>,
+    pub execute_in_flight: Arc<AtomicU64>,
+    /// Maximum time (ms) a job may wait in the queue before being shed.
+    pub max_queue_wait_ms: u64,
 }
 
 pub async fn run_worker(
@@ -45,10 +55,69 @@ pub async fn run_worker(
 }
 
 async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std::io::Error> {
+    // ── Queue-time shedding ───────────────────────────────────────
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let queue_wait_ms = now_ms.saturating_sub(job.enqueued_at);
+
+    if queue_wait_ms > data.max_queue_wait_ms {
+        warn!(
+            job_id = %job.id,
+            language = %job.language,
+            queue_wait_ms = queue_wait_ms,
+            max_wait_ms = data.max_queue_wait_ms,
+            "shedding stale job: exceeded max queue wait time"
+        );
+        data.jobs_failed.fetch_add(1, Ordering::Relaxed);
+        data.jobs_in_flight.fetch_sub(1, Ordering::Relaxed);
+        write_job_state(
+            &data.redis_pool,
+            &data.job_state_prefix,
+            JobStateRecord {
+                job_id: job.id.clone(),
+                status: "queue_timeout".to_string(),
+                language: job.language.clone(),
+                version: job.version.clone(),
+                result: None,
+                error: Some(format!(
+                    "job waited {}ms in queue (max: {}ms)",
+                    queue_wait_ms, data.max_queue_wait_ms
+                )),
+                queue_wait_ms: Some(queue_wait_ms),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // ── Acquire category semaphore ────────────────────────────────
+    let (semaphore, category_counter, category_name) = match job.job_type {
+        JobType::Compile => (
+            data.compile_semaphore.clone(),
+            data.compile_in_flight.clone(),
+            "compile",
+        ),
+        JobType::Execute => (
+            data.execute_semaphore.clone(),
+            data.execute_in_flight.clone(),
+            "execute",
+        ),
+    };
+
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|e| std::io::Error::other(format!("semaphore closed for {category_name}: {e}")))?;
+    category_counter.fetch_add(1, Ordering::Relaxed);
+
     info!(
         job_id = %job.id,
         language = %job.language,
         version = %job.version,
+        job_type = category_name,
+        queue_wait_ms = queue_wait_ms,
         "job starting"
     );
 
@@ -62,6 +131,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             version: job.version.clone(),
             result: None,
             error: None,
+            queue_wait_ms: Some(queue_wait_ms),
         },
     )
     .await?;
@@ -70,11 +140,15 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
     let result = process_job(&job, &data).await;
     let elapsed = start.elapsed();
 
+    // Release category counter (semaphore permit drops automatically).
+    category_counter.fetch_sub(1, Ordering::Relaxed);
+
     match result {
         Ok(job_result) => {
             info!(
                 job_id = %job.id,
                 language = %job.language,
+                job_type = category_name,
                 duration_ms = elapsed.as_millis() as u64,
                 "job completed successfully"
             );
@@ -90,6 +164,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     version: job.version.clone(),
                     result: Some(job_result.clone()),
                     error: None,
+                    queue_wait_ms: Some(queue_wait_ms),
                 },
             )
             .await?;
@@ -98,6 +173,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             error!(
                 job_id = %job.id,
                 language = %job.language,
+                job_type = category_name,
                 error = %source,
                 duration_ms = elapsed.as_millis() as u64,
                 "job failed"
@@ -114,6 +190,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     version: job.version.clone(),
                     result: None,
                     error: Some(source.to_string()),
+                    queue_wait_ms: Some(queue_wait_ms),
                 },
             )
             .await?;
@@ -236,7 +313,8 @@ async fn write_job_state(
     let key = job_state_key(prefix, &state.job_id);
     let payload = serde_json::to_string(&state)
         .map_err(|source| std::io::Error::other(source.to_string()))?;
-    let is_terminal = state.status == "completed" || state.status == "failed";
+    let is_terminal =
+        state.status == "completed" || state.status == "failed" || state.status == "queue_timeout";
     let mut conn = pool
         .get()
         .await

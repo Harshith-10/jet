@@ -126,7 +126,7 @@ struct BenchmarkArgs {
     )]
     server: String,
 
-    #[arg(long = "poll-interval", value_parser = parse_duration, default_value = "200ms", help = "Interval to poll job status")]
+    #[arg(long = "poll-interval", value_parser = parse_duration, default_value = "500ms", help = "Interval to poll job status")]
     poll_interval: Duration,
 
     #[arg(long = "poll-timeout", value_parser = parse_duration, default_value = "60s", help = "Timeout for single job completion")]
@@ -367,7 +367,7 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
     let first_error = Arc::new(Mutex::new(None));
 
     let mut tasks = Vec::new();
-    for _ in 0..args.concurrency {
+    for worker_id in 0..args.concurrency {
         let counter = next_index.clone();
         let success = success_counter.clone();
         let failure = failure_counter.clone();
@@ -381,7 +381,20 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
         let pb = pb.clone();
 
         tasks.push(tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            // Each worker uses a unique X-Forwarded-For IP so the server's
+            // per-IP rate limiter gives each worker its own bucket instead of
+            // throttling them all under 127.0.0.1.
+            let mut headers = reqwest::header::HeaderMap::new();
+            let fake_ip = format!("10.0.{}.{}", worker_id / 256, worker_id % 256);
+            headers.insert(
+                "X-Forwarded-For",
+                reqwest::header::HeaderValue::from_str(&fake_ip).unwrap(),
+            );
+            let client = reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap();
+
             loop {
                 let i = counter.fetch_add(1, Ordering::SeqCst);
                 if i >= args.requests {
@@ -832,6 +845,12 @@ async fn poll_job_until_done(
 
         if status == StatusCode::NOT_FOUND {
             tokio::time::sleep(poll_interval).await;
+            continue;
+        }
+
+        // Rate-limited: back off instead of failing.
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            tokio::time::sleep(poll_interval * 2).await;
             continue;
         }
 

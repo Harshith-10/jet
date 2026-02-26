@@ -7,6 +7,7 @@ use apalis_redis::RedisStorage;
 use deadpool_redis::{Config as PoolConfig, Runtime as PoolRuntime, redis::AsyncCommands};
 use jet_core::JetConfig;
 use jet_pack::{RedisVersionStore, VersionResolver};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 mod api;
@@ -17,19 +18,6 @@ mod worker;
 /// The namespace apalis-redis uses for our QueuedJob type.
 /// apalis defaults to `std::any::type_name::<T>()`.
 const APALIS_QUEUE_NAMESPACE: &str = "jet_server::queue::QueuedJob";
-
-/// All the key suffixes apalis-redis creates under the namespace.
-const APALIS_KEY_SUFFIXES: &[&str] = &[
-    "active",
-    "consumers",
-    "dead",
-    "done",
-    "failed",
-    "inflight",
-    "data",
-    "scheduled",
-    "signal",
-];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -123,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jobs_in_flight = Arc::new(AtomicU64::new(0));
 
     // Determine worker concurrency: defaults to CPU core count.
-    let worker_concurrency = std::env::var("JET_WORKER_CONCURRENCY")
+    let cpu_cores = std::env::var("JET_WORKER_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
@@ -132,11 +120,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(1)
         });
 
+    // MLP: split concurrency between compile (heavy) and execute (lightweight).
+    let compile_concurrency = std::env::var("JET_COMPILE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (cpu_cores / 4).max(1));
+
+    let execute_concurrency = std::env::var("JET_EXECUTE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| cpu_cores.saturating_sub(compile_concurrency).max(1));
+
+    let worker_concurrency = compile_concurrency + execute_concurrency;
+
     // Maximum queue depth before rejecting new submissions (backpressure).
     let max_queue_depth = std::env::var("JET_MAX_QUEUE_DEPTH")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or_else(|| (worker_concurrency as u64) * 10);
+
+    // Queue-time shedding: max seconds a job can wait in the queue.
+    let max_queue_wait_secs: u64 = std::env::var("JET_MAX_QUEUE_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    // Create MLP semaphores.
+    let compile_semaphore = Arc::new(Semaphore::new(compile_concurrency));
+    let execute_semaphore = Arc::new(Semaphore::new(execute_concurrency));
+
+    // Per-category in-flight counters.
+    let compile_in_flight = Arc::new(AtomicU64::new(0));
+    let execute_in_flight = Arc::new(AtomicU64::new(0));
 
     let api_state = api::ApiState {
         resolver: Arc::new(resolver),
@@ -151,6 +166,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker_concurrency,
         jobs_in_flight: jobs_in_flight.clone(),
         max_queue_depth,
+        compile_in_flight: compile_in_flight.clone(),
+        execute_in_flight: execute_in_flight.clone(),
+        compile_concurrency,
+        execute_concurrency,
+        max_queue_wait_secs,
     };
 
     let worker_context = worker::runner::WorkerContext {
@@ -161,6 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jobs_completed,
         jobs_failed,
         jobs_in_flight,
+        compile_semaphore,
+        execute_semaphore,
+        compile_in_flight,
+        execute_in_flight,
+        max_queue_wait_ms: max_queue_wait_secs * 1000,
     };
 
     let worker_redis_url = config.redis_url.clone();
@@ -185,6 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         installed = manifest_count,
         total_manifests = total_manifest_count,
         worker_concurrency = worker_concurrency,
+        compile_concurrency = compile_concurrency,
+        execute_concurrency = execute_concurrency,
+        max_queue_depth = max_queue_depth,
+        max_queue_wait_secs = max_queue_wait_secs,
         cache_key = %config.runtime_cache_key,
         "startup complete: loaded installed runtimes, version map cached"
     );
@@ -214,18 +243,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Flush all stale apalis queue keys from Redis.
 ///
-/// This prevents old jobs from previous server runs from being re-processed
-/// on startup (which would fail with "manifest missing" errors).
+/// Uses a wildcard scan to remove every key under the apalis namespace,
+/// including worker heartbeats and Lua-script state that apalis-redis 1.0
+/// maintains beyond the basic queue keys.
 async fn flush_stale_queue(
     conn: &mut apalis_redis::ConnectionManager,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut removed = 0usize;
-    for suffix in APALIS_KEY_SUFFIXES {
-        let key = format!("{}:{}", APALIS_QUEUE_NAMESPACE, suffix);
-        let deleted: usize = conn.del(&key).await.unwrap_or(0);
-        removed += deleted;
+    let pattern = format!("{}:*", APALIS_QUEUE_NAMESPACE);
+    let keys: Vec<String> = deadpool_redis::redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(conn)
+        .await?;
+
+    let count = keys.len();
+    for key in &keys {
+        let _: () = conn.del(key).await.unwrap_or(());
     }
-    Ok(removed)
+    Ok(count)
 }
 
 /// Clean up orphaned job workspace directories from previous server runs

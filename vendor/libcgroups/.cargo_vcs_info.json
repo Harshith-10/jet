@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "bd54457ba9de1629f21fe678687f433aec63e7c7"
+  },
+  "path_in_vcs": "crates/libcgroups"
+}
