@@ -237,6 +237,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => error!(error = %e, "worker stopped with error"),
     }
 
+    // Flush stale jobs and worker heartbeats from Redis so we leave it clean.
+    match flush_stale_queue(&mut flush_conn).await {
+        Ok(count) if count > 0 => {
+            info!(
+                keys_removed = count,
+                "flushed stale queue cleanly on shutdown"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!(error = %err, "failed to flush stale queue on shutdown");
+        }
+    }
+
     info!("shutdown complete");
     Ok(())
 }
