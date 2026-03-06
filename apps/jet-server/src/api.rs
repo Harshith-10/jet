@@ -264,7 +264,8 @@ async fn submit_job(
             ),
         ))?;
 
-    let manifest_key = format!("{}:{}", request.language, resolved);
+    let canonical_lang = state.resolver.canonical_language(&request.language);
+    let manifest_key = format!("{}:{}", canonical_lang, resolved);
     let manifest = state.manifests.get(&manifest_key).ok_or((
         StatusCode::BAD_REQUEST,
         format!("runtime is not installed: {}", manifest_key),

@@ -101,11 +101,16 @@ impl VersionStore for RedisVersionStore {
 #[derive(Debug, Clone)]
 pub struct VersionResolver<S: VersionStore> {
     store: S,
+    /// Maps language aliases to their canonical language name.
+    alias_map: HashMap<String, String>,
 }
 
 impl<S: VersionStore> VersionResolver<S> {
     pub fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            alias_map: HashMap::new(),
+        }
     }
 
     pub fn initialize_from_manifests(
@@ -113,6 +118,7 @@ impl<S: VersionStore> VersionResolver<S> {
         manifests: &[RuntimeManifest],
     ) -> JetPackResult<()> {
         let map = build_version_map(manifests)?;
+        self.alias_map = build_alias_map(manifests);
         self.store.set_many(map)?;
         Ok(())
     }
@@ -126,8 +132,15 @@ impl<S: VersionStore> VersionResolver<S> {
         Ok(manifests)
     }
 
+    /// Returns the canonical language name for the given name or alias.
+    /// If the name is already canonical (or unknown), it is returned as-is.
+    pub fn canonical_language<'a>(&'a self, name: &'a str) -> &'a str {
+        self.alias_map.get(name).map(|s| s.as_str()).unwrap_or(name)
+    }
+
     pub fn resolve(&self, language: &str, requested: &str) -> JetPackResult<Option<String>> {
-        self.store.get(&format!("{}:{}", language, requested))
+        let lang = self.canonical_language(language);
+        self.store.get(&format!("{}:{}", lang, requested))
     }
 }
 
@@ -216,6 +229,28 @@ pub fn build_version_map(manifests: &[RuntimeManifest]) -> JetPackResult<HashMap
     }
 
     Ok(map)
+}
+
+/// Builds a mapping from language aliases to their canonical language name.
+///
+/// For example, if a manifest has `language: "cpp"` and
+/// `aliases: ["cpp", "c++", "g++", "cxx"]`, this produces:
+///   "c++" → "cpp", "g++" → "cpp", "cxx" → "cpp"
+///
+/// The canonical name itself is *not* included as a key (it maps to itself
+/// by convention in `canonical_language`).
+fn build_alias_map(manifests: &[RuntimeManifest]) -> HashMap<String, String> {
+    let mut alias_map = HashMap::new();
+    for manifest in manifests {
+        for alias in &manifest.aliases {
+            if alias != &manifest.language {
+                alias_map
+                    .entry(alias.clone())
+                    .or_insert_with(|| manifest.language.clone());
+            }
+        }
+    }
+    alias_map
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -349,6 +384,7 @@ mod tests {
                 jvm_flags: None,
             },
             compile: None,
+            starter_code: None,
         }
     }
 

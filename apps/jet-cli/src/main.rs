@@ -15,7 +15,7 @@ use console::{Emoji, Style, style};
 use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
 use jet_core::{FileRequest, JetConfig, JobRequest, JobResult};
-use jet_pack::{JavaCorrettoUpdater, PackageManager, PythonStandaloneUpdater};
+use jet_pack::{PackageManager, get_updaters};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -155,7 +155,19 @@ struct BenchmarkArgs {
 enum UpdateTarget {
     Java,
     Python,
+    Zig,
     All,
+}
+
+impl From<UpdateTarget> for jet_pack::UpdateTarget {
+    fn from(t: UpdateTarget) -> Self {
+        match t {
+            UpdateTarget::Java => Self::Java,
+            UpdateTarget::Python => Self::Python,
+            UpdateTarget::Zig => Self::Zig,
+            UpdateTarget::All => Self::All,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -167,10 +179,15 @@ enum RuntimesSubcommands {
         #[arg(long = "arch", default_value = "x86_64")]
         arch: String,
     },
+    Uninstall {
+        language: String,
+        version: String,
+    },
     Update {
         #[arg(value_enum, default_value = "all")]
         language: UpdateTarget,
     },
+    Clean,
 }
 
 #[derive(Args, Debug)]
@@ -556,7 +573,11 @@ fn runtimes_command(cmd: RuntimesCommand) -> Result<()> {
             version,
             arch,
         } => runtimes_install(&manager, &language, &version, &arch),
+        RuntimesSubcommands::Uninstall { language, version } => {
+            runtimes_uninstall(&manager, &language, &version)
+        }
         RuntimesSubcommands::Update { language } => runtimes_update(&manager, language),
+        RuntimesSubcommands::Clean => runtimes_clean(&manager),
     }
 }
 
@@ -633,6 +654,7 @@ fn runtimes_install(
     spinner.set_message(format!("{}Scanning manifests…", LOOKING_GLASS));
 
     let resolver = manager.build_resolver()?;
+    let canonical_lang = resolver.canonical_language(language);
     let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
         spinner.finish_with_message(format!(
             "{}Manifest not found for {}:{}",
@@ -644,7 +666,7 @@ fn runtimes_install(
     let manifests = manager.scan_manifests()?;
     let manifest = manifests
         .into_iter()
-        .find(|m| m.language == language && m.version == resolved_version)
+        .find(|m| m.language == canonical_lang && m.version == resolved_version)
         .ok_or_else(|| {
             spinner.finish_with_message(format!(
                 "{}Manifest not found for resolved version {}:{}",
@@ -670,12 +692,23 @@ fn runtimes_install(
         style(&resolved_version).yellow()
     ));
 
-    let installed = manager.install_runtime_with_progress(&manifest, arch, &download_bar);
+    let extract_spinner = make_spinner();
+    extract_spinner.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+
+    let installed = manager.install_runtime_with_progress(&manifest, arch, &download_bar, || {
+        download_bar.finish_with_message(format!("{}Download complete", CHECKMARK));
+        extract_spinner.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        extract_spinner.set_message(format!(
+            "{}Extracting {} {}…",
+            PACKAGE,
+            style(language).green(),
+            style(&resolved_version).yellow()
+        ));
+    });
 
     match installed {
         Ok(path) => {
-            download_bar
-                .finish_with_message(format!("{}Download & extraction complete", CHECKMARK));
+            extract_spinner.finish_with_message(format!("{}Extraction complete", CHECKMARK));
 
             let elapsed = start.elapsed();
 
@@ -695,8 +728,91 @@ fn runtimes_install(
             Ok(())
         }
         Err(e) => {
+            extract_spinner.finish_and_clear();
             download_bar.abandon_with_message(format!("{}Installation failed", CROSS));
             println!("\n  {} {}\n", CROSS, style(format!("{e}")).red());
+            Err(e.into())
+        }
+    }
+}
+
+fn runtimes_uninstall(manager: &PackageManager, language: &str, version: &str) -> Result<()> {
+    let spinner = make_spinner();
+    spinner.set_message(format!(
+        "{}Resolving {} {}…",
+        LOOKING_GLASS,
+        style(language).green(),
+        style(version).yellow()
+    ));
+
+    let resolver = manager.build_resolver()?;
+    let canonical_lang = resolver.canonical_language(language);
+    let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
+        spinner.finish_with_message(format!(
+            "{}Could not resolve {}:{}",
+            CROSS, language, version
+        ));
+        anyhow!("could not resolve version {version} for {language}")
+    })?;
+
+    spinner.set_message(format!(
+        "{}Uninstalling {} {}…",
+        LOOKING_GLASS,
+        style(canonical_lang).green(),
+        style(&resolved_version).yellow()
+    ));
+
+    match manager.uninstall_runtime(canonical_lang, &resolved_version) {
+        Ok(true) => {
+            spinner.finish_with_message(format!(
+                "{}Uninstalled {} {}",
+                CHECKMARK,
+                style(canonical_lang).green(),
+                style(&resolved_version).yellow()
+            ));
+            Ok(())
+        }
+        Ok(false) => {
+            spinner.finish_with_message(format!(
+                "{}Runtime {} {} is not installed",
+                CROSS,
+                style(canonical_lang).yellow(),
+                style(&resolved_version).yellow()
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            spinner.finish_with_message(format!(
+                "{}Failed to uninstall {} {}: {}",
+                CROSS,
+                style(canonical_lang).yellow(),
+                style(&resolved_version).yellow(),
+                style(&e).red()
+            ));
+            Err(e.into())
+        }
+    }
+}
+
+fn runtimes_clean(manager: &PackageManager) -> Result<()> {
+    let spinner = make_spinner();
+    spinner.set_message(format!("{}Cleaning download cache…", LOOKING_GLASS));
+
+    match manager.clean_downloads() {
+        Ok(count) => {
+            spinner.finish_with_message(format!(
+                "{}Removed {} cached archive(s)",
+                CHECKMARK,
+                style(count).bold()
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            spinner.finish_with_message(format!(
+                "{}Failed to clean downloads: {}",
+                CROSS,
+                style(&e).red()
+            ));
             Err(e.into())
         }
     }
@@ -710,18 +826,10 @@ fn runtimes_update(manager: &PackageManager, target: UpdateTarget) -> Result<()>
     );
 
     let mut total = 0usize;
+    let updaters = get_updaters(target.into());
 
-    match target {
-        UpdateTarget::Java => {
-            total += run_updater(manager, &JavaCorrettoUpdater::default());
-        }
-        UpdateTarget::Python => {
-            total += run_updater(manager, &PythonStandaloneUpdater);
-        }
-        UpdateTarget::All => {
-            total += run_updater(manager, &JavaCorrettoUpdater::default());
-            total += run_updater(manager, &PythonStandaloneUpdater);
-        }
+    for updater in &updaters {
+        total += run_updater(manager, updater.as_ref());
     }
 
     println!(
@@ -732,7 +840,7 @@ fn runtimes_update(manager: &PackageManager, target: UpdateTarget) -> Result<()>
     Ok(())
 }
 
-fn run_updater<U: jet_pack::RuntimeUpdater>(manager: &PackageManager, updater: &U) -> usize {
+fn run_updater(manager: &PackageManager, updater: &dyn jet_pack::RuntimeUpdater) -> usize {
     let spinner = make_spinner();
     spinner.set_message(format!(
         "{}Fetching latest {} versions…",

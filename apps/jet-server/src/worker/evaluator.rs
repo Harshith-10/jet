@@ -9,6 +9,8 @@ use crate::sandbox::{Sandbox, SandboxProfile, SandboxResult};
 const DEFAULT_COMPILE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_JVM_COMPILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_JVM_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_COMPILE_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_COMPILE_TIMEOUT_MS: u64 = 30_000;
 
 /// Fallback JVM flags used when the manifest does not specify `jvm_flags`.
 const DEFAULT_JAVA_COMPILE_JVM_FLAGS: &[&str] = &[
@@ -80,12 +82,14 @@ impl Evaluator {
             compile_limits.memory_limit_bytes = request
                 .compile_memory_limit
                 .unwrap_or_else(|| compile_limits.memory_limit_bytes.max(default_compile_mem));
-            if let Some(output_limit) = request.compile_output_limit {
-                compile_limits.output_limit_bytes = output_limit;
-            }
-            if let Some(timeout) = request.compile_timeout {
-                compile_limits.timeout_ms = timeout;
-            }
+            compile_limits.output_limit_bytes = request.compile_output_limit.unwrap_or_else(|| {
+                compile_limits
+                    .output_limit_bytes
+                    .max(DEFAULT_COMPILE_OUTPUT_LIMIT_BYTES)
+            });
+            compile_limits.timeout_ms = request
+                .compile_timeout
+                .unwrap_or_else(|| compile_limits.timeout_ms.max(DEFAULT_COMPILE_TIMEOUT_MS));
 
             let mut sandbox = Sandbox::new(
                 &compile_limits,
@@ -122,7 +126,7 @@ impl Evaluator {
                 java_compile_flags.iter().map(|s| s.as_str()).collect();
             full_compile_args.extend_from_slice(&compile_args);
 
-            let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin")];
+            let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin"), ("HOME", "/tmp")];
 
             let timeout = compile_limits.timeout_ms;
 
@@ -197,7 +201,7 @@ impl Evaluator {
         let mut full_run_args: Vec<&str> = run_jvm_flags_owned.iter().map(|s| s.as_str()).collect();
         full_run_args.extend_from_slice(&run_args);
 
-        let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin")];
+        let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin"), ("HOME", "/tmp")];
         let timeout = run_limits.timeout_ms;
 
         if let Some(testcases) = &request.testcases {

@@ -23,7 +23,7 @@ impl SandboxProfile {
     pub fn strict() -> Self {
         Self {
             enable_cgroups: true,
-            enable_landlock: true,
+            enable_landlock: false, // TEMP: disabled for debugging
             enable_seccomp: false, // Disabled for Java compatibility (requires complex syscall mapping)
             collect_metrics: true,
         }
@@ -62,6 +62,7 @@ impl Sandbox {
             .bindmount_ro("/usr", "/usr")
             .bindmount_rw(workspace, "/workspace")
             .devfsmount("/dev")
+            .procfsmount("/proc")
             .tmpfsmount("/tmp");
 
         #[cfg(target_arch = "x86_64")]
@@ -121,6 +122,7 @@ impl Sandbox {
             ruleset.add_fs_rule("/lib64", FsAccess::from_str("r-x").unwrap());
             ruleset.add_fs_rule("/usr", FsAccess::from_str("r-x").unwrap());
             ruleset.add_fs_rule("/dev", FsAccess::from_str("r--").unwrap());
+            ruleset.add_fs_rule("/proc", FsAccess::from_str("r--").unwrap());
             ruleset.add_fs_rule("/tmp", FsAccess::from_str("rwx").unwrap());
             ruleset.add_fs_rule("/workspace", FsAccess::from_str("rwx").unwrap());
             if runtime_dir.is_some() {

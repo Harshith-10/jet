@@ -2,6 +2,7 @@ use std::{fs, io, path::Path};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use xz2::read::XzDecoder;
 use zip::ZipArchive;
 
 use crate::error::{JetPackError, JetPackResult};
@@ -21,6 +22,10 @@ pub fn extract_archive(archive_path: &Path, destination: &Path) -> JetPackResult
         return extract_tar_gz(archive_path, destination);
     }
 
+    if file_name.ends_with(".tar.xz") {
+        return extract_tar_xz(archive_path, destination);
+    }
+
     if file_name.ends_with(".zip") {
         return extract_zip(archive_path, destination);
     }
@@ -37,6 +42,66 @@ fn extract_tar_gz(archive_path: &Path, destination: &Path) -> JetPackResult<()> 
     })?;
 
     let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+
+    let canonical_dest = destination
+        .canonicalize()
+        .map_err(|source| JetPackError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+
+    for entry in archive.entries().map_err(|source| JetPackError::Io {
+        path: archive_path.to_path_buf(),
+        source,
+    })? {
+        let mut entry = entry.map_err(|source| JetPackError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+
+        let path = entry.path().map_err(|source| JetPackError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+
+        let output_path = canonical_dest.join(path);
+        // Ensure no path traversal
+        if !output_path.starts_with(&canonical_dest) {
+            return Err(JetPackError::Io {
+                path: output_path,
+                source: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path traversal detected in tar archive",
+                ),
+            });
+        }
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| JetPackError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        entry
+            .unpack(&output_path)
+            .map_err(|source| JetPackError::Io {
+                path: output_path,
+                source,
+            })?;
+    }
+
+    Ok(())
+}
+
+fn extract_tar_xz(archive_path: &Path, destination: &Path) -> JetPackResult<()> {
+    let file = fs::File::open(archive_path).map_err(|source| JetPackError::Io {
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
+
+    let decoder = XzDecoder::new(file);
     let mut archive = Archive::new(decoder);
 
     let canonical_dest = destination

@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use jet_pack::{JavaCorrettoUpdater, PackageManager, PythonStandaloneUpdater};
+use jet_pack::{PackageManager, get_updaters};
 
 #[derive(Debug, Parser)]
 #[command(name = "jet-pack", about = "Jet package and manifest manager")]
@@ -20,15 +20,27 @@ struct Cli {
 enum Command {
     Update {
         #[arg(value_enum)]
-        language: UpdateTarget,
+        language: CliUpdateTarget,
     },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum UpdateTarget {
+enum CliUpdateTarget {
     Java,
     Python,
+    Zig,
     All,
+}
+
+impl From<CliUpdateTarget> for jet_pack::UpdateTarget {
+    fn from(t: CliUpdateTarget) -> Self {
+        match t {
+            CliUpdateTarget::Java => Self::Java,
+            CliUpdateTarget::Python => Self::Python,
+            CliUpdateTarget::Zig => Self::Zig,
+            CliUpdateTarget::All => Self::All,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -57,26 +69,17 @@ fn main() -> ExitCode {
 }
 
 fn run_update(
-    language: UpdateTarget,
+    language: CliUpdateTarget,
     manager: &PackageManager,
 ) -> Result<usize, jet_pack::JetPackError> {
-    match language {
-        UpdateTarget::Java => manager
-            .update_manifests_with_updater(&JavaCorrettoUpdater::default())
-            .map(|paths| paths.len()),
-        UpdateTarget::Python => manager
-            .update_manifests_with_updater(&PythonStandaloneUpdater)
-            .map(|paths| paths.len()),
-        UpdateTarget::All => {
-            let java = manager
-                .update_manifests_with_updater(&JavaCorrettoUpdater::default())?
-                .len();
-            let python = manager
-                .update_manifests_with_updater(&PythonStandaloneUpdater)?
-                .len();
-            Ok(java + python)
-        }
+    let updaters = get_updaters(language.into());
+    let mut total = 0;
+    for updater in &updaters {
+        total += manager
+            .update_manifests_with_updater(updater.as_ref())?
+            .len();
     }
+    Ok(total)
 }
 
 fn default_runtime_dir() -> PathBuf {
