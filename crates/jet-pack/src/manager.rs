@@ -9,10 +9,33 @@ use crate::{
     archive::extract_archive,
     downloader::{download_to_path, download_to_path_with_progress},
     error::{JetPackError, JetPackResult},
+    installer::{InstallContext, get_installer_for},
     manifest::RuntimeManifest,
     resolver::{InMemoryVersionStore, VersionResolver, scan_manifest_dir},
     updater::RuntimeUpdater,
 };
+
+/// Result of resolving a language + version to a concrete manifest.
+#[derive(Debug, Clone)]
+pub struct ResolvedManifest {
+    /// The canonical language name (e.g. `"cpp"` even if `"c++"` was requested).
+    pub canonical_language: String,
+    /// The fully qualified version string (e.g. `"3.14.3"` from `"3"`).
+    pub resolved_version: String,
+    /// The matched manifest.
+    pub manifest: RuntimeManifest,
+}
+
+/// Result of a successful runtime installation.
+#[derive(Debug, Clone)]
+pub struct InstallResult {
+    /// The canonical language name.
+    pub canonical_language: String,
+    /// The fully qualified version string.
+    pub resolved_version: String,
+    /// Path to the extracted runtime root directory.
+    pub installed_path: PathBuf,
+}
 
 #[derive(Debug, Clone)]
 pub struct ManifestSource {
@@ -49,11 +72,52 @@ impl PackageManager {
         Ok(resolver)
     }
 
+    /// Resolve a language name + version string to the concrete manifest.
+    ///
+    /// Handles alias resolution (e.g. `"c++"` → `"cpp"`) and version
+    /// resolution (e.g. `"3"` → `"3.14.3"`) in one call.
+    pub fn resolve_manifest(
+        &self,
+        language: &str,
+        version: &str,
+    ) -> JetPackResult<ResolvedManifest> {
+        let resolver = self.build_resolver()?;
+        let canonical_lang = resolver.canonical_language(language).to_owned();
+        let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
+            JetPackError::ManifestNotFound {
+                language: language.to_string(),
+                version: version.to_string(),
+            }
+        })?;
+
+        let manifests = self.scan_manifests()?;
+        let manifest = manifests
+            .into_iter()
+            .find(|m| m.language == canonical_lang && m.version == resolved_version)
+            .ok_or_else(|| JetPackError::ManifestNotFound {
+                language: language.to_string(),
+                version: resolved_version.clone(),
+            })?;
+
+        Ok(ResolvedManifest {
+            canonical_language: canonical_lang,
+            resolved_version,
+            manifest,
+        })
+    }
+
     pub fn install_runtime(
         &self,
         manifest: &RuntimeManifest,
         arch: &str,
     ) -> JetPackResult<PathBuf> {
+        let installer = get_installer_for(&manifest.language);
+        let ctx = InstallContext {
+            runtime_dir: &self.runtime_dir,
+            manifest,
+            arch,
+        };
+
         let archive = manifest
             .runtimes
             .get(arch)
@@ -68,9 +132,8 @@ impl PackageManager {
             source,
         })?;
 
-        if manifest.language == "java" {
-            remove_old_java_major_installs(&self.runtime_dir, &manifest.version)?;
-        }
+        // Pre-install hook (e.g. Java old-major cleanup)
+        installer.pre_install(&ctx)?;
 
         // Download archive to shared cache directory
         let cached_archive = self.download_to_cache(&archive.url)?;
@@ -97,6 +160,9 @@ impl PackageManager {
         extract_archive(&cached_archive, &extracted_path)?;
         flatten_single_top_level_dir(&extracted_path)?;
 
+        // Post-install hook (e.g. Zig cache dir creation)
+        installer.post_install(&ctx, &extracted_path)?;
+
         Ok(extracted_path)
     }
 
@@ -108,6 +174,13 @@ impl PackageManager {
         download_progress: &ProgressBar,
         on_extract: impl FnOnce(),
     ) -> JetPackResult<PathBuf> {
+        let installer = get_installer_for(&manifest.language);
+        let ctx = InstallContext {
+            runtime_dir: &self.runtime_dir,
+            manifest,
+            arch,
+        };
+
         let archive = manifest
             .runtimes
             .get(arch)
@@ -122,9 +195,8 @@ impl PackageManager {
             source,
         })?;
 
-        if manifest.language == "java" {
-            remove_old_java_major_installs(&self.runtime_dir, &manifest.version)?;
-        }
+        // Pre-install hook (e.g. Java old-major cleanup)
+        installer.pre_install(&ctx)?;
 
         // Download archive to shared cache directory (skip if cached)
         let cached_archive =
@@ -155,7 +227,54 @@ impl PackageManager {
         extract_archive(&cached_archive, &extracted_path)?;
         flatten_single_top_level_dir(&extracted_path)?;
 
+        // Post-install hook (e.g. Zig cache dir creation)
+        installer.post_install(&ctx, &extracted_path)?;
+
         Ok(extracted_path)
+    }
+
+    /// High-level install: resolve version + find manifest + install + run hooks.
+    ///
+    /// Combines [`resolve_manifest`](Self::resolve_manifest) and
+    /// [`install_runtime`](Self::install_runtime) into a single call.
+    pub fn full_install(
+        &self,
+        language: &str,
+        version: &str,
+        arch: &str,
+    ) -> JetPackResult<InstallResult> {
+        let resolved = self.resolve_manifest(language, version)?;
+        let installed_path = self.install_runtime(&resolved.manifest, arch)?;
+
+        Ok(InstallResult {
+            canonical_language: resolved.canonical_language,
+            resolved_version: resolved.resolved_version,
+            installed_path,
+        })
+    }
+
+    /// Like [`full_install`](Self::full_install) but reports download progress.
+    pub fn full_install_with_progress(
+        &self,
+        language: &str,
+        version: &str,
+        arch: &str,
+        download_progress: &ProgressBar,
+        on_extract: impl FnOnce(),
+    ) -> JetPackResult<InstallResult> {
+        let resolved = self.resolve_manifest(language, version)?;
+        let installed_path = self.install_runtime_with_progress(
+            &resolved.manifest,
+            arch,
+            download_progress,
+            on_extract,
+        )?;
+
+        Ok(InstallResult {
+            canonical_language: resolved.canonical_language,
+            resolved_version: resolved.resolved_version,
+            installed_path,
+        })
     }
 
     /// Returns the path to the cached archive, downloading only if not already present.
@@ -346,55 +465,6 @@ fn archive_file_name(url: &str) -> String {
         .filter(|v| !v.is_empty())
         .unwrap_or("runtime.tar.gz")
         .to_string()
-}
-
-fn remove_old_java_major_installs(
-    runtime_dir: &PathBuf,
-    incoming_version: &str,
-) -> JetPackResult<()> {
-    let major = incoming_version
-        .split('.')
-        .next()
-        .ok_or_else(|| JetPackError::InvalidVersion {
-            value: incoming_version.to_string(),
-        })?;
-
-    let java_dir = runtime_dir.join("java");
-    if !java_dir.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(&java_dir).map_err(|source| JetPackError::Io {
-        path: java_dir.clone(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| JetPackError::Io {
-            path: java_dir.clone(),
-            source,
-        })?;
-
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let Some(version) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-
-        if version == incoming_version {
-            continue;
-        }
-
-        if version.split('.').next() == Some(major) {
-            fs::remove_dir_all(&path).map_err(|source| JetPackError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        }
-    }
-
-    Ok(())
 }
 
 fn flatten_single_top_level_dir(extracted_path: &Path) -> JetPackResult<()> {
@@ -602,20 +672,6 @@ mod tests {
 
         assert_eq!(written.len(), 1);
         assert!(written[0].exists());
-    }
-
-    #[test]
-    fn java_install_removes_old_major_versions() {
-        let dir = tempdir().expect("temp dir should exist");
-        let java_base = dir.path().join("runtimes").join("java");
-        fs::create_dir_all(java_base.join("21.0.9.10.1")).expect("old version dir");
-        fs::create_dir_all(java_base.join("17.0.18.9.1")).expect("different major dir");
-
-        remove_old_java_major_installs(&dir.path().join("runtimes"), "21.0.10.7.1")
-            .expect("prune should pass");
-
-        assert!(!java_base.join("21.0.9.10.1").exists());
-        assert!(java_base.join("17.0.18.9.1").exists());
     }
 
     #[test]

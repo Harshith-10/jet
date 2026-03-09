@@ -1,9 +1,11 @@
 mod java_corretto;
 mod python_standalone;
+mod rust;
 mod zig;
 
 pub use java_corretto::{JavaCorrettoUpdater, parse_corretto_release_manifest};
 pub use python_standalone::{PythonStandaloneUpdater, parse_python_release_manifests};
+pub use rust::{RustUpdater, parse_rust_channel_manifest};
 pub use zig::{ZigUpdater, parse_zig_index};
 
 use serde_json::Value;
@@ -29,6 +31,7 @@ pub trait RuntimeUpdater {
 pub enum UpdateTarget {
     Java,
     Python,
+    Rust,
     Zig,
     All,
 }
@@ -38,10 +41,12 @@ pub fn get_updaters(target: UpdateTarget) -> Vec<Box<dyn RuntimeUpdater>> {
     match target {
         UpdateTarget::Java => vec![Box::new(JavaCorrettoUpdater::default())],
         UpdateTarget::Python => vec![Box::new(PythonStandaloneUpdater)],
+        UpdateTarget::Rust => vec![Box::new(RustUpdater)],
         UpdateTarget::Zig => vec![Box::new(ZigUpdater)],
         UpdateTarget::All => vec![
             Box::new(JavaCorrettoUpdater::default()),
             Box::new(PythonStandaloneUpdater),
+            Box::new(RustUpdater),
             Box::new(ZigUpdater),
         ],
     }
@@ -72,5 +77,33 @@ pub(crate) fn fetch_json(url: &str) -> JetPackResult<Value> {
 
     serde_json::from_str(&text).map_err(|error| JetPackError::Serialization {
         message: format!("failed to parse JSON response from {url}: {error}"),
+    })
+}
+
+/// Fetches a URL and returns the raw response body as a string.
+///
+/// Used by updaters that consume non-JSON formats (e.g. the Rust
+/// stable channel manifest which is TOML).
+pub(crate) fn fetch_text(url: &str) -> JetPackResult<String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("jet-pack-updater")
+        .build()
+        .map_err(|source| JetPackError::Http {
+            url: url.to_string(),
+            source,
+        })?;
+
+    let response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|source| JetPackError::Http {
+            url: url.to_string(),
+            source,
+        })?;
+
+    response.text().map_err(|source| JetPackError::Http {
+        url: url.to_string(),
+        source,
     })
 }

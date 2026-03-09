@@ -40,6 +40,9 @@ pub enum JetPackError {
     #[error("invalid version in manifest: {value}")]
     InvalidVersion { value: String },
 
+    #[error("manifest not found for language={language} version={version}")]
+    ManifestNotFound { language: String, version: String },
+
     #[error("serialization error: {message}")]
     Serialization { message: String },
 

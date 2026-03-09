@@ -28,6 +28,7 @@ enum Command {
 enum CliUpdateTarget {
     Java,
     Python,
+    Rust,
     Zig,
     All,
 }
@@ -37,6 +38,7 @@ impl From<CliUpdateTarget> for jet_pack::UpdateTarget {
         match t {
             CliUpdateTarget::Java => Self::Java,
             CliUpdateTarget::Python => Self::Python,
+            CliUpdateTarget::Rust => Self::Rust,
             CliUpdateTarget::Zig => Self::Zig,
             CliUpdateTarget::All => Self::All,
         }

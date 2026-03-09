@@ -660,76 +660,59 @@ fn runtimes_install(
     );
     println!("  {}", style("─".repeat(48)).dim());
 
-    // ── Step 1: Scan manifests ──────────────────────────────────
+    // ── Step 1: Resolve manifest ────────────────────────────────
     let spinner = make_spinner();
     spinner.set_message(format!("{}Scanning manifests…", LOOKING_GLASS));
 
-    let resolver = manager.build_resolver()?;
-    let canonical_lang = resolver.canonical_language(language);
-    let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
+    let resolved = manager.resolve_manifest(language, version).map_err(|e| {
         spinner.finish_with_message(format!(
             "{}Manifest not found for {}:{}",
             CROSS, language, version
         ));
-        anyhow!("manifest not found for {language}:{version}")
+        anyhow::Error::from(e)
     })?;
-
-    let manifests = manager.scan_manifests()?;
-    let manifest = manifests
-        .into_iter()
-        .find(|m| m.language == canonical_lang && m.version == resolved_version)
-        .ok_or_else(|| {
-            spinner.finish_with_message(format!(
-                "{}Manifest not found for resolved version {}:{}",
-                CROSS, language, resolved_version
-            ));
-            anyhow!("manifest not found for {language}:{resolved_version}")
-        })?;
 
     spinner.finish_with_message(format!(
         "{}Resolved {} to {} {}",
         CHECKMARK,
         style(version).dim(),
         style(language).green(),
-        style(&resolved_version).yellow()
+        style(&resolved.resolved_version).yellow()
     ));
 
-    // ── Step 2: Download ────────────────────────────────────────
+    // ── Step 2: Download + install (hooks run automatically) ────
     let download_bar = make_download_bar();
     download_bar.set_message(format!(
         "{}Downloading {} {} archive…",
         DOWNLOAD,
         style(language).green(),
-        style(&resolved_version).yellow()
+        style(&resolved.resolved_version).yellow()
     ));
 
     let extract_spinner = make_spinner();
     extract_spinner.set_draw_target(indicatif::ProgressDrawTarget::hidden());
 
-    let installed = manager.install_runtime_with_progress(&manifest, arch, &download_bar, || {
-        download_bar.finish_with_message(format!("{}Download complete", CHECKMARK));
-        extract_spinner.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-        extract_spinner.set_message(format!(
-            "{}Extracting {} {}…",
-            PACKAGE,
-            style(language).green(),
-            style(&resolved_version).yellow()
-        ));
-    });
+    let lang_owned = language.to_string();
+    let ver_owned = resolved.resolved_version.clone();
+    let installed = manager.install_runtime_with_progress(
+        &resolved.manifest,
+        arch,
+        &download_bar,
+        || {
+            download_bar.finish_with_message(format!("{}Download complete", CHECKMARK));
+            extract_spinner.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+            extract_spinner.set_message(format!(
+                "{}Extracting {} {}…",
+                PACKAGE,
+                style(&lang_owned).green(),
+                style(&ver_owned).yellow()
+            ));
+        },
+    );
 
     match installed {
         Ok(path) => {
             extract_spinner.finish_with_message(format!("{}Extraction complete", CHECKMARK));
-
-            // Create the zig-cache directory for C/C++/Zig runtimes.
-            // The actual cache population happens on the server side
-            // (first compilation inside a sandbox) so cache keys match
-            // the sandbox mount layout.
-            if jet_pack::manager::is_zig_language(canonical_lang) {
-                if let Err(e) = jet_pack::manager::prepare_zig_cache_dir(&path) {
-                    eprintln!("  {} cache dir setup skipped: {}", CROSS, e);
-                }
-            }
 
             let elapsed = start.elapsed();
 
@@ -766,30 +749,28 @@ fn runtimes_uninstall(manager: &PackageManager, language: &str, version: &str) -
         style(version).yellow()
     ));
 
-    let resolver = manager.build_resolver()?;
-    let canonical_lang = resolver.canonical_language(language);
-    let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
+    let resolved = manager.resolve_manifest(language, version).map_err(|e| {
         spinner.finish_with_message(format!(
             "{}Could not resolve {}:{}",
             CROSS, language, version
         ));
-        anyhow!("could not resolve version {version} for {language}")
+        anyhow::Error::from(e)
     })?;
 
     spinner.set_message(format!(
         "{}Uninstalling {} {}…",
         LOOKING_GLASS,
-        style(canonical_lang).green(),
-        style(&resolved_version).yellow()
+        style(&resolved.canonical_language).green(),
+        style(&resolved.resolved_version).yellow()
     ));
 
-    match manager.uninstall_runtime(canonical_lang, &resolved_version) {
+    match manager.uninstall_runtime(&resolved.canonical_language, &resolved.resolved_version) {
         Ok(true) => {
             spinner.finish_with_message(format!(
                 "{}Uninstalled {} {}",
                 CHECKMARK,
-                style(canonical_lang).green(),
-                style(&resolved_version).yellow()
+                style(&resolved.canonical_language).green(),
+                style(&resolved.resolved_version).yellow()
             ));
             Ok(())
         }
@@ -797,8 +778,8 @@ fn runtimes_uninstall(manager: &PackageManager, language: &str, version: &str) -
             spinner.finish_with_message(format!(
                 "{}Runtime {} {} is not installed",
                 CROSS,
-                style(canonical_lang).yellow(),
-                style(&resolved_version).yellow()
+                style(&resolved.canonical_language).yellow(),
+                style(&resolved.resolved_version).yellow()
             ));
             Ok(())
         }
@@ -806,8 +787,8 @@ fn runtimes_uninstall(manager: &PackageManager, language: &str, version: &str) -
             spinner.finish_with_message(format!(
                 "{}Failed to uninstall {} {}: {}",
                 CROSS,
-                style(canonical_lang).yellow(),
-                style(&resolved_version).yellow(),
+                style(&resolved.canonical_language).yellow(),
+                style(&resolved.resolved_version).yellow(),
                 style(&e).red()
             ));
             Err(e.into())
