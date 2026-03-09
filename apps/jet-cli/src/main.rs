@@ -721,23 +721,13 @@ fn runtimes_install(
         Ok(path) => {
             extract_spinner.finish_with_message(format!("{}Extraction complete", CHECKMARK));
 
-            // Warm up Zig's global cache for C/C++/Zig runtimes so that
-            // sandboxed compilations don't pay the 10 s decompression cost.
+            // Create the zig-cache directory for C/C++/Zig runtimes.
+            // The actual cache population happens on the server side
+            // (first compilation inside a sandbox) so cache keys match
+            // the sandbox mount layout.
             if jet_pack::manager::is_zig_language(canonical_lang) {
-                let warmup_spinner = make_spinner();
-                warmup_spinner.set_message(format!(
-                    "{}Warming up compiler cache…",
-                    LOOKING_GLASS
-                ));
-                match jet_pack::manager::warm_zig_cache(&path) {
-                    Ok(()) => warmup_spinner.finish_with_message(format!(
-                        "{}Compiler cache warmed",
-                        CHECKMARK
-                    )),
-                    Err(e) => warmup_spinner.finish_with_message(format!(
-                        "{}Cache warm-up skipped: {}",
-                        CROSS, e
-                    )),
+                if let Err(e) = jet_pack::manager::prepare_zig_cache_dir(&path) {
+                    eprintln!("  {} cache dir setup skipped: {}", CROSS, e);
                 }
             }
 

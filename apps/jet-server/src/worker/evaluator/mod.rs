@@ -2,10 +2,11 @@ pub mod generic;
 pub mod java;
 pub mod traits;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use jet_core::models::{ExecutionLimits, JobRequest, JobResult, StageStatus, TestcaseResult};
 use jet_pack::RuntimeManifest;
+use tracing::{info, warn};
 
 use crate::sandbox::{Sandbox, SandboxProfile, SandboxResult};
 
@@ -18,6 +19,14 @@ const DEFAULT_JVM_COMPILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_JVM_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_COMPILE_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_COMPILE_TIMEOUT_MS: u64 = 30_000;
+
+/// Minimal C++ source used to warm up Zig's global cache inside a sandbox.
+///
+/// `#include <iostream>` forces Zig to decompress the bundled libc++
+/// headers, which is the expensive part (~10 s on first run).
+const ZIG_WARMUP_CPP: &str = r#"#include <iostream>
+int main() { std::cout << "ok" << std::endl; return 0; }
+"#;
 
 /// Fallback JVM flags used when the manifest does not specify `jvm_flags`.
 const DEFAULT_JAVA_COMPILE_JVM_FLAGS: &[&str] = &[
@@ -75,6 +84,73 @@ impl Evaluator {
         }
     }
 
+    /// Warm up the Zig global cache by compiling a trivial C++ program
+    /// inside a real sandbox.  Only runs once per cache directory (tracked
+    /// by a `.warmed` sentinel file).
+    fn ensure_zig_cache_warm(cache_dir: &Path, runtime_dir: Option<&Path>) -> SandboxResult<()> {
+        let sentinel = cache_dir.join(".warmed");
+        if sentinel.exists() {
+            return Ok(());
+        }
+
+        info!("warming up zig cache (first use)");
+
+        // Build a temporary workspace for the warm-up compilation.
+        let warmup_dir =
+            std::env::temp_dir().join(format!("jet-zig-warmup-{}", std::process::id()));
+        std::fs::create_dir_all(&warmup_dir)?;
+        std::fs::write(warmup_dir.join("warmup.cpp"), ZIG_WARMUP_CPP)?;
+
+        let limits = ExecutionLimits {
+            memory_limit_bytes: DEFAULT_COMPILE_MEMORY_BYTES,
+            output_limit_bytes: DEFAULT_COMPILE_OUTPUT_LIMIT_BYTES,
+            timeout_ms: 120_000, // generous: first-ever decompress can be slow
+            ..ExecutionLimits::default()
+        };
+
+        let mut sandbox = Sandbox::with_cache(
+            &limits,
+            &warmup_dir,
+            runtime_dir,
+            Some(cache_dir),
+            &SandboxProfile::strict(),
+        )?;
+
+        let envs = vec![
+            ("PATH", "/opt/runtime/bin:/usr/bin:/bin"),
+            ("HOME", "/tmp"),
+            ("ZIG_GLOBAL_CACHE_DIR", "/opt/zig-cache"),
+            ("ZIG_LOCAL_CACHE_DIR", "/tmp/zig-local-cache"),
+        ];
+
+        let result = sandbox.run(
+            "/opt/runtime/zig",
+            &["c++", "warmup.cpp", "-o", "warmup_bin", "-O3"],
+            Some(&envs),
+            None,
+            120_000,
+        )?;
+
+        // Clean up temp workspace.
+        let _ = std::fs::remove_dir_all(&warmup_dir);
+
+        if result.status == StageStatus::Success {
+            // Mark cache as warm so subsequent calls skip the warm-up.
+            let _ = std::fs::write(&sentinel, "warmed");
+            info!(
+                execution_time_ms = result.execution_time,
+                "zig cache warm-up complete"
+            );
+        } else {
+            warn!(
+                stderr = %result.stderr.trim(),
+                "zig cache warm-up failed (non-fatal)"
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn evaluate(&self, request: &JobRequest) -> SandboxResult<JobResult> {
         let backend = backend_for(&self.manifest.language);
 
@@ -99,6 +175,12 @@ impl Evaluator {
         // 2. Compile if necessary
         let mut compile_result = None;
         if let Some(compile_template) = &self.manifest.compile {
+            // Ensure the Zig global cache is warm before the first real
+            // compilation so users don't pay the ~10 s decompression cost.
+            if let Some(cache_dir) = &self.cache_dir {
+                let _ = Self::ensure_zig_cache_warm(cache_dir, self.runtime_dir.as_deref());
+            }
+
             let mut compile_limits = self.limits.clone();
 
             // Base compile-limit defaults.
@@ -134,8 +216,7 @@ impl Evaluator {
                 .map(|a| substitute(a))
                 .unwrap_or_default();
 
-            let full_compile_args_owned =
-                backend.build_compile_args(template_args, &self.manifest);
+            let full_compile_args_owned = backend.build_compile_args(template_args, &self.manifest);
             let full_compile_args: Vec<&str> =
                 full_compile_args_owned.iter().map(|s| s.as_str()).collect();
 

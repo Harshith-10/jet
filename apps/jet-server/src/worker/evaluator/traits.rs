@@ -21,11 +21,7 @@ pub struct WriteResult {
 pub trait LanguageBackend {
     /// Write the submitted source files into `workspace` and return
     /// metadata about the primary file.
-    fn write_files(
-        &self,
-        workspace: &Path,
-        files: &[FileRequest],
-    ) -> std::io::Result<WriteResult>;
+    fn write_files(&self, workspace: &Path, files: &[FileRequest]) -> std::io::Result<WriteResult>;
 
     /// Adjust compilation limits (called before the compile sandbox is
     /// created).  The default implementation is a no-op.

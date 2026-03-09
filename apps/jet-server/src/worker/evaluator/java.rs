@@ -95,8 +95,7 @@ fn class_body_has_main(source: &str, class_name: &str) -> bool {
             .unwrap_or(rest.len());
         let body = &rest[..end];
         // Match `public static void main` with optional whitespace.
-        let main_re =
-            regex::Regex::new(r"public\s+static\s+void\s+main\s*\(").unwrap();
+        let main_re = regex::Regex::new(r"public\s+static\s+void\s+main\s*\(").unwrap();
         return main_re.is_match(body);
     }
     false
@@ -107,11 +106,7 @@ fn class_body_has_main(source: &str, class_name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 impl LanguageBackend for JavaBackend {
-    fn write_files(
-        &self,
-        workspace: &Path,
-        files: &[FileRequest],
-    ) -> std::io::Result<WriteResult> {
+    fn write_files(&self, workspace: &Path, files: &[FileRequest]) -> std::io::Result<WriteResult> {
         let mut primary_file = "Main.java".to_string();
         let mut class_name: Option<String> = None;
 
@@ -184,17 +179,18 @@ impl LanguageBackend for JavaBackend {
         template_args: Vec<String>,
         manifest: &RuntimeManifest,
     ) -> Vec<String> {
-        let jvm_flags: Vec<String> = manifest
-            .execute
-            .jvm_flags
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| {
-                DEFAULT_JAVA_RUN_JVM_FLAGS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            });
+        let jvm_flags: Vec<String> =
+            manifest
+                .execute
+                .jvm_flags
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| {
+                    DEFAULT_JAVA_RUN_JVM_FLAGS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                });
 
         let mut args = jvm_flags;
         args.extend(template_args);
@@ -250,10 +246,7 @@ public class Solution {
     }
 }
 "#;
-        assert_eq!(
-            extract_public_class_name(src),
-            Some("Solution".to_string())
-        );
+        assert_eq!(extract_public_class_name(src), Some("Solution".to_string()));
     }
 
     #[test]

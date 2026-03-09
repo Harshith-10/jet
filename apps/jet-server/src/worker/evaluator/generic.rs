@@ -10,11 +10,7 @@ use super::traits::{LanguageBackend, WriteResult};
 pub struct GenericBackend;
 
 impl LanguageBackend for GenericBackend {
-    fn write_files(
-        &self,
-        workspace: &Path,
-        files: &[FileRequest],
-    ) -> std::io::Result<WriteResult> {
+    fn write_files(&self, workspace: &Path, files: &[FileRequest]) -> std::io::Result<WriteResult> {
         let mut primary_file = "main".to_string();
 
         for (i, file) in files.iter().enumerate() {
