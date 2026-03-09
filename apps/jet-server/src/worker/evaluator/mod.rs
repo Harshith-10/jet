@@ -4,7 +4,9 @@ pub mod traits;
 
 use std::path::{Path, PathBuf};
 
-use jet_core::models::{ExecutionLimits, JobRequest, JobResult, StageStatus, TestcaseResult};
+use jet_core::models::{
+    ExecutionLimits, JobRequest, JobResult, StageResult, StageStatus, TestcaseResult,
+};
 use jet_pack::RuntimeManifest;
 use tracing::{info, warn};
 
@@ -235,11 +237,21 @@ impl Evaluator {
             let result = sandbox.run(cmd, &full_compile_args, Some(&envs), None, timeout)?;
 
             if result.status != StageStatus::Success {
+                // The sandbox classifies all non-zero exits generically.
+                // For the compile stage, any non-success status (that
+                // isn't TLE/MLE/OLE) is a compilation error.
+                let compile_status = match result.status {
+                    StageStatus::RuntimeError => StageStatus::CompilationError,
+                    other => other,
+                };
                 return Ok(JobResult {
                     language: request.language.clone(),
                     version: request.version.clone().unwrap_or_default(),
                     run: None,
-                    compile: Some(result),
+                    compile: Some(StageResult {
+                        status: compile_status,
+                        ..result
+                    }),
                     testcases: None,
                 });
             }

@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -8,6 +9,7 @@ use hakoniwa::{
     seccomp::{Action, Arch, ArgCmp, Filter},
 };
 use jet_core::models::{ExecutionLimits, StageResult, StageStatus};
+use tracing::warn;
 
 use super::error::{SandboxError, SandboxResult};
 
@@ -32,6 +34,10 @@ impl SandboxProfile {
 
 pub struct Sandbox {
     container: Container,
+    /// Maximum bytes to read from stdout/stderr pipes before truncating.
+    output_limit_bytes: u64,
+    /// Physical memory limit — used to distinguish MLE from TLE on SIGKILL.
+    memory_limit_bytes: u64,
 }
 
 impl Sandbox {
@@ -259,7 +265,11 @@ impl Sandbox {
             container.runctl(Runctl::GetProcPidSmapsRollup);
         }
 
-        Ok(Self { container })
+        Ok(Self {
+            container,
+            output_limit_bytes: limits.output_limit_bytes,
+            memory_limit_bytes: limits.memory_limit_bytes,
+        })
     }
 
     pub fn run(
@@ -296,53 +306,64 @@ impl Sandbox {
                 let _ = stdin.write_all(data.as_bytes());
             }
         }
+        // Explicitly drop stdin so the child sees EOF.
+        drop(child.stdin.take());
 
-        let output = child.wait_with_output()?;
-        let status = output.status;
+        // ── Read stdout/stderr with a byte cap ──────────────────────
+        //
+        // hakoniwa's `wait_with_output()` does an unbounded
+        // `read_to_end` on both pipes.  A fast writer (e.g. `printf`
+        // in a tight loop) can fill hundreds of MB into the pipe
+        // before the timeout fires and kills the child, causing the
+        // worker to OOM or stall.
+        //
+        // We take the pipes ourselves and read at most
+        // `output_limit_bytes` from each, then kill the child if it
+        // was still going.
+        let max_bytes = self.output_limit_bytes as usize;
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated) =
+            match (stdout_pipe, stderr_pipe) {
+                (None, None) => (vec![], false, vec![], false),
+                (Some(out), None) => {
+                    let (data, trunc) = read_pipe_limited(out, max_bytes);
+                    (data, trunc, vec![], false)
+                }
+                (None, Some(err)) => {
+                    let (data, trunc) = read_pipe_limited(err, max_bytes);
+                    (vec![], false, data, trunc)
+                }
+                (Some(out), Some(err)) => std::thread::scope(|s| {
+                    let h_out = s.spawn(|| read_pipe_limited(out, max_bytes));
+                    let h_err = s.spawn(|| read_pipe_limited(err, max_bytes));
+                    let (out_data, out_trunc) =
+                        h_out.join().unwrap_or_else(|_| (vec![], false));
+                    let (err_data, err_trunc) =
+                        h_err.join().unwrap_or_else(|_| (vec![], false));
+                    (out_data, out_trunc, err_data, err_trunc)
+                }),
+            };
+
+        let output_truncated = stdout_truncated || stderr_truncated;
+
+        // If we hit the output cap, kill the child immediately so it
+        // stops writing and we can proceed to `wait()`.
+        if output_truncated {
+            let _ = child.kill();
+        }
+
+        // Wait for exit status (the timeout/alarm will still fire if
+        // the child hasn't died yet).
+        let status = child.wait()?;
         let is_success = status.success();
 
         let reason_lc = status.reason.to_lowercase();
         let internal_code = status.code;
         let process_exit_code = status.exit_code;
 
-        let stage_status = if is_success {
-            StageStatus::Success
-        } else if reason_lc.contains("timed out")
-            || internal_code == 128 + libc::SIGKILL
-            || process_exit_code == Some(128 + libc::SIGKILL)
-        {
-            StageStatus::TimeLimitExceeded
-        } else if reason_lc.contains("output limit exceeded")
-            || internal_code == 128 + libc::SIGXFSZ
-            || process_exit_code == Some(128 + libc::SIGXFSZ)
-        {
-            StageStatus::OutputLimitExceeded
-        } else if reason_lc.contains("cannot allocate memory")
-            || reason_lc.contains("out of memory")
-            || internal_code == 128 + libc::SIGABRT
-            || process_exit_code == Some(128 + libc::SIGABRT)
-        {
-            StageStatus::MemoryLimitExceeded
-        } else {
-            StageStatus::RuntimeError
-        };
-
-        let signal = if internal_code == 128 + libc::SIGKILL
-            || process_exit_code == Some(128 + libc::SIGKILL)
-        {
-            Some("SIGKILL".to_string())
-        } else if internal_code == 128 + libc::SIGXFSZ
-            || process_exit_code == Some(128 + libc::SIGXFSZ)
-        {
-            Some("SIGXFSZ".to_string())
-        } else if internal_code == 128 + libc::SIGABRT
-            || process_exit_code == Some(128 + libc::SIGABRT)
-        {
-            Some("SIGABRT".to_string())
-        } else {
-            None
-        };
-
+        // ── Collect resource metrics ────────────────────────────────
         let mut memory_usage = None;
         let mut cpu_time = None;
         let mut execution_time = None;
@@ -359,21 +380,115 @@ impl Sandbox {
             memory_usage = Some(proc_status.vmhwm * 1024);
         }
 
-        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if stderr.trim().is_empty() && !is_success {
-            stderr = status.reason.clone();
+        // ── Determine stage status ──────────────────────────────────
+        //
+        // Priority order:
+        //   1. Success
+        //   2. Output-limit exceeded (truncation-based or SIGXFSZ)
+        //   3. Memory-limit exceeded (heuristic on SIGKILL + peak RSS)
+        //   4. Time-limit exceeded    (SIGKILL fallback)
+        //   5. Runtime error
+        let is_sigkill = internal_code == 128 + libc::SIGKILL
+            || process_exit_code == Some(128 + libc::SIGKILL);
+        let is_sigxfsz = internal_code == 128 + libc::SIGXFSZ
+            || process_exit_code == Some(128 + libc::SIGXFSZ);
+        let is_sigabrt = internal_code == 128 + libc::SIGABRT
+            || process_exit_code == Some(128 + libc::SIGABRT);
+
+        // Heuristic: if peak memory ≥ 80 % of the cgroup limit the
+        // process was almost certainly OOM-killed, not timed-out.
+        let mem_near_limit = memory_usage
+            .map(|m| m >= self.memory_limit_bytes * 80 / 100)
+            .unwrap_or(false);
+        // Check stderr for allocation-failure messages (e.g. Rust
+        // panics with "memory allocation of N bytes failed").
+        let stderr_lc = String::from_utf8_lossy(&stderr_bytes).to_lowercase();
+        let alloc_failure_in_stderr = stderr_lc.contains("memory allocation")
+            && stderr_lc.contains("failed")
+            || stderr_lc.contains("out of memory")
+            || stderr_lc.contains("cannot allocate memory");
+        let stage_status = if is_success && !output_truncated {
+            StageStatus::Success
+        } else if output_truncated
+            || reason_lc.contains("output limit exceeded")
+            || is_sigxfsz
+        {
+            StageStatus::OutputLimitExceeded
+        } else if reason_lc.contains("cannot allocate memory")
+            || reason_lc.contains("out of memory")
+            || is_sigabrt
+            || (is_sigkill && mem_near_limit)
+            || alloc_failure_in_stderr
+        {
+            StageStatus::MemoryLimitExceeded
+        } else if reason_lc.contains("timed out") || is_sigkill {
+            StageStatus::TimeLimitExceeded
+        } else {
+            StageStatus::RuntimeError
+        };
+
+        if output_truncated {
+            warn!(
+                stdout_bytes = stdout_bytes.len(),
+                stderr_bytes = stderr_bytes.len(),
+                limit = max_bytes,
+                "output truncated — classified as OLE"
+            );
+        }
+
+        let signal = if is_sigkill {
+            Some("SIGKILL".to_string())
+        } else if is_sigxfsz {
+            Some("SIGXFSZ".to_string())
+        } else if is_sigabrt {
+            Some("SIGABRT".to_string())
+        } else {
+            None
+        };
+
+        let mut stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        if stderr_str.trim().is_empty() && !is_success {
+            stderr_str = status.reason.clone();
         }
 
         Ok(StageResult {
             status: stage_status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr,
+            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+            stderr: stderr_str,
             exit_code: process_exit_code,
             signal,
             memory_usage,
             cpu_time,
             execution_time,
         })
+    }
+}
+
+/// Read from a pipe up to `max_bytes`, then stop.  Returns the data
+/// collected and whether the limit was hit (i.e. the stream was
+/// truncated and there was likely more data).
+fn read_pipe_limited(mut reader: impl Read, max_bytes: usize) -> (Vec<u8>, bool) {
+    // Pre-allocate conservatively (cap at 1 MiB initial alloc).
+    let mut buf = Vec::with_capacity(max_bytes.min(1024 * 1024));
+    let mut tmp = [0u8; 8192];
+
+    loop {
+        match reader.read(&mut tmp) {
+            Ok(0) => return (buf, false), // EOF — not truncated
+            Ok(n) => {
+                let remaining = max_bytes.saturating_sub(buf.len());
+                let to_keep = n.min(remaining);
+                if to_keep > 0 {
+                    buf.extend_from_slice(&tmp[..to_keep]);
+                }
+                if buf.len() >= max_bytes {
+                    // Hit the cap.  Drop the reader so the child
+                    // gets SIGPIPE on its next write.
+                    return (buf, true);
+                }
+            }
+            Err(_) => return (buf, false),
+        }
     }
 }
 

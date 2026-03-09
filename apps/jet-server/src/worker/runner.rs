@@ -252,18 +252,53 @@ async fn process_job(
         limits.output_limit_bytes = output_limit;
     }
 
+    // ── Wall-clock safety net ─────────────────────────────────────
+    //
+    // Compute a generous upper bound: compile + (run × testcases) + buffer.
+    // This prevents a misbehaving sandbox from blocking a worker thread
+    // indefinitely (which would eventually starve the Redis consumer).
+    let num_testcases = job
+        .request
+        .testcases
+        .as_ref()
+        .map(|t| t.len() as u64)
+        .unwrap_or(1);
+    let compile_ms = job.request.compile_timeout.unwrap_or(30_000);
+    let run_ms = job.request.run_timeout.unwrap_or(limits.timeout_ms);
+    let wall_clock_limit =
+        std::time::Duration::from_millis(compile_ms + run_ms * num_testcases + 60_000);
+
     // Run the evaluator on a blocking thread so it doesn't starve
     // the async runtime while sandbox processes are executing.
     let request = job.request.clone();
     let ws = workspace_dir.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let evaluator = Evaluator::new(ws, Some(runtime_root_dir), zig_cache_dir, manifest, limits);
-        evaluator
-            .evaluate(&request)
-            .map_err(|source| std::io::Error::other(source.to_string()))
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("spawn_blocking join error: {e}")));
+    let result = tokio::time::timeout(
+        wall_clock_limit,
+        tokio::task::spawn_blocking(move || {
+            let evaluator =
+                Evaluator::new(ws, Some(runtime_root_dir), zig_cache_dir, manifest, limits);
+            evaluator
+                .evaluate(&request)
+                .map_err(|source| std::io::Error::other(source.to_string()))
+        }),
+    )
+    .await;
+
+    let result = match result {
+        Ok(inner) => inner
+            .map_err(|e| std::io::Error::other(format!("spawn_blocking join error: {e}"))),
+        Err(_elapsed) => {
+            warn!(
+                job_id = %job.id,
+                wall_clock_limit_ms = wall_clock_limit.as_millis() as u64,
+                "job exceeded wall-clock limit — aborting"
+            );
+            Err(std::io::Error::other(format!(
+                "job exceeded wall-clock limit of {}s",
+                wall_clock_limit.as_secs()
+            )))
+        }
+    };
 
     // Always clean up workspace, regardless of success or failure.
     cleanup_workspace(&workspace_dir, &job.id).await;
