@@ -52,6 +52,8 @@ fn backend_for(language: &str) -> Box<dyn LanguageBackend> {
 pub struct Evaluator {
     workspace_dir: PathBuf,
     runtime_dir: Option<PathBuf>,
+    /// Pre-warmed Zig global cache directory (if applicable).
+    cache_dir: Option<PathBuf>,
     manifest: RuntimeManifest,
     limits: ExecutionLimits,
 }
@@ -60,12 +62,14 @@ impl Evaluator {
     pub fn new(
         workspace_dir: PathBuf,
         runtime_dir: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
         manifest: RuntimeManifest,
         limits: ExecutionLimits,
     ) -> Self {
         Self {
             workspace_dir,
             runtime_dir,
+            cache_dir,
             manifest,
             limits,
         }
@@ -115,10 +119,11 @@ impl Evaluator {
             // Language-specific adjustments (e.g. JVM memory).
             backend.adjust_compile_limits(&mut compile_limits, &self.manifest);
 
-            let mut sandbox = Sandbox::new(
+            let mut sandbox = Sandbox::with_cache(
                 &compile_limits,
                 &self.workspace_dir,
                 self.runtime_dir.as_deref(),
+                self.cache_dir.as_deref(),
                 &SandboxProfile::strict(),
             )?;
 
@@ -134,7 +139,16 @@ impl Evaluator {
             let full_compile_args: Vec<&str> =
                 full_compile_args_owned.iter().map(|s| s.as_str()).collect();
 
-            let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin"), ("HOME", "/tmp")];
+            let mut envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin"), ("HOME", "/tmp")];
+
+            // Point Zig at the pre-warmed global cache (read-write inside
+            // the sandbox) so it skips the ~10 s header decompression.
+            // Only set the env var when a cache was actually bind-mounted.
+            if self.cache_dir.is_some() {
+                envs.push(("ZIG_GLOBAL_CACHE_DIR", "/opt/zig-cache"));
+                envs.push(("ZIG_LOCAL_CACHE_DIR", "/tmp/zig-local-cache"));
+            }
+
             let timeout = compile_limits.timeout_ms;
 
             let result = sandbox.run(cmd, &full_compile_args, Some(&envs), None, timeout)?;

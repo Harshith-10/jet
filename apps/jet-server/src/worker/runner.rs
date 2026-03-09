@@ -232,6 +232,10 @@ async fn process_job(
         )));
     }
 
+    // Zig-based runtimes (c, cpp, zig) may have a pre-warmed global cache
+    // that avoids the ~10 s header-decompression penalty inside the sandbox.
+    let zig_cache_dir = jet_pack::manager::zig_cache_dir_for(&runtime_root_dir);
+
     let workspace_dir = data.runtime_install_dir.join("jobs").join(&job.id);
     fs::create_dir_all(&workspace_dir)
         .await
@@ -253,7 +257,7 @@ async fn process_job(
     let request = job.request.clone();
     let ws = workspace_dir.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let evaluator = Evaluator::new(ws, Some(runtime_root_dir), manifest, limits);
+        let evaluator = Evaluator::new(ws, Some(runtime_root_dir), zig_cache_dir, manifest, limits);
         evaluator
             .evaluate(&request)
             .map_err(|source| std::io::Error::other(source.to_string()))

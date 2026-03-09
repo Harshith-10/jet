@@ -41,6 +41,18 @@ impl Sandbox {
         runtime_dir: Option<&Path>,
         profile: &SandboxProfile,
     ) -> SandboxResult<Self> {
+        Self::with_cache(limits, workspace_dir, runtime_dir, None, profile)
+    }
+
+    /// Like [`Self::new`] but also bind-mounts a compiler cache directory
+    /// (read-write) at `/opt/zig-cache` inside the sandbox.
+    pub fn with_cache(
+        limits: &ExecutionLimits,
+        workspace_dir: &Path,
+        runtime_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
+        profile: &SandboxProfile,
+    ) -> SandboxResult<Self> {
         let mut container = Container::new();
 
         container
@@ -73,6 +85,13 @@ impl Sandbox {
                 SandboxError::ExecutionFailed("runtime path is not valid UTF-8".to_string())
             })?;
             container.bindmount_ro(runtime, "/opt/runtime");
+        }
+
+        if let Some(cd) = cache_dir {
+            let cache = cd.to_str().ok_or_else(|| {
+                SandboxError::ExecutionFailed("cache path is not valid UTF-8".to_string())
+            })?;
+            container.bindmount_rw(cache, "/opt/zig-cache");
         }
 
         // When cgroups are enabled, physical memory is enforced there.

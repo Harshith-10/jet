@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use indicatif::ProgressBar;
@@ -305,6 +306,83 @@ impl PackageManager {
 
         Ok(count)
     }
+}
+
+/// Minimal C++ source used to warm up Zig's global cache.
+///
+/// `#include <iostream>` forces Zig to decompress the bundled libc++
+/// headers, which is the expensive part (~10 s on first run).
+const WARMUP_CPP_SOURCE: &str = r#"#include <iostream>
+int main() { std::cout << "ok" << std::endl; return 0; }
+"#;
+
+/// Returns `true` for languages that use Zig as their compiler backend.
+pub fn is_zig_language(language: &str) -> bool {
+    matches!(language, "c" | "cpp" | "zig")
+}
+
+/// Warm up Zig's global cache by compiling a trivial C++ program.
+///
+/// Zig lazily decompresses bundled libc/libc++ headers on first use,
+/// which can take 10+ seconds inside a sandboxed container (where the
+/// cache is discarded after each run).  Running a single warm-up
+/// compilation at install time populates a `zig-cache` directory inside
+/// the runtime root so that the sandbox can bind-mount it read-only.
+/// Returns the path to the Zig global cache directory for a given runtime
+/// root.  The cache lives as a sibling of `root/` so it can be bind-mounted
+/// independently (read-write) into the sandbox.
+///
+/// Layout: `<runtime_install_dir>/<lang>/<version>/zig-cache/`
+pub fn zig_cache_dir_for(runtime_root: &Path) -> Option<PathBuf> {
+    let cache = runtime_root.parent()?.join("zig-cache");
+    if cache.is_dir() { Some(cache) } else { None }
+}
+
+pub fn warm_zig_cache(runtime_root: &Path) -> JetPackResult<()> {
+    let zig_binary = runtime_root.join("zig");
+    if !zig_binary.exists() {
+        return Ok(());
+    }
+
+    // Place cache as sibling of root/ so it can be separately bind-mounted.
+    let cache_dir = runtime_root
+        .parent()
+        .map(|p| p.join("zig-cache"))
+        .unwrap_or_else(|| runtime_root.join("zig-cache"));
+    fs::create_dir_all(&cache_dir).map_err(|source| JetPackError::Io {
+        path: cache_dir.clone(),
+        source,
+    })?;
+
+    // Create a temporary workspace with a trivial C++ file.
+    let tmp = tempfile::tempdir().map_err(|source| JetPackError::Io {
+        path: PathBuf::from("/tmp"),
+        source,
+    })?;
+    let cpp_file = tmp.path().join("warmup.cpp");
+    fs::write(&cpp_file, WARMUP_CPP_SOURCE).map_err(|source| JetPackError::Io {
+        path: cpp_file.clone(),
+        source,
+    })?;
+
+    let output = Command::new(&zig_binary)
+        .args(["c++", "warmup.cpp", "-o", "main", "-O3"])
+        .current_dir(tmp.path())
+        .env("ZIG_GLOBAL_CACHE_DIR", &cache_dir)
+        .output()
+        .map_err(|source| JetPackError::Io {
+            path: zig_binary.clone(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(JetPackError::Serialization {
+            message: format!("zig cache warm-up failed: {}", stderr.trim()),
+        });
+    }
+
+    Ok(())
 }
 
 /// Extracts a file name from a URL for use as the cache key.
