@@ -176,7 +176,7 @@ enum RuntimesSubcommands {
     Install {
         language: String,
         version: String,
-        #[arg(long = "arch", default_value = "x86_64")]
+        #[arg(long = "arch", default_value_t = default_arch())]
         arch: String,
     },
     Uninstall {
@@ -231,6 +231,17 @@ struct JobStateRecord {
     version: String,
     result: Option<JobResult>,
     error: Option<String>,
+}
+
+/// Detect the host CPU architecture and normalise it to the key used in
+/// runtime manifests (`"x86_64"` or `"aarch64"`).
+fn default_arch() -> String {
+    match std::env::consts::ARCH {
+        "amd64" | "x86_64" => "x86_64",
+        "arm64" | "aarch64" => "aarch64",
+        other => other,
+    }
+    .to_string()
 }
 
 fn main() -> Result<()> {

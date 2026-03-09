@@ -139,6 +139,10 @@ impl Sandbox {
                 filter.add_arch(Arch::X86);
                 filter.add_arch(Arch::X32);
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                filter.add_arch(Arch::Aarch64);
+            }
 
             let allowed_syscalls = [
                 "access",
