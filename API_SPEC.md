@@ -4,7 +4,7 @@ This document provides a comprehensive overview of the Jet Server API. Jet is a 
 
 ## Base URL
 
-The server typically runs on `http://localhost:3000` (configurable).
+The server typically runs on `http://localhost:4000` (configurable).
 
 ## Rate Limiting
 

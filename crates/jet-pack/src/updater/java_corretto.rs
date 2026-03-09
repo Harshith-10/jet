@@ -145,7 +145,7 @@ pub fn parse_corretto_release_manifest(
         }),
         execute: ExecutionTemplate {
             command: "/opt/runtime/bin/java".to_string(),
-            args: Some(vec!["-cp".to_string(), ".".to_string(), "Main".to_string()]),
+            args: Some(vec!["-cp".to_string(), ".".to_string(), "{class}".to_string()]),
             jvm_flags: Some(vec![
                 "-Xms8m".to_string(),
                 "-Xmx64m".to_string(),

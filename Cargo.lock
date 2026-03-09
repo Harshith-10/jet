@@ -1649,6 +1649,7 @@ dependencies = [
  "jet-pack",
  "libc",
  "mini-redis",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

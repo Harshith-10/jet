@@ -1,10 +1,17 @@
-use std::fs;
+pub mod generic;
+pub mod java;
+pub mod traits;
+
 use std::path::PathBuf;
 
 use jet_core::models::{ExecutionLimits, JobRequest, JobResult, StageStatus, TestcaseResult};
 use jet_pack::RuntimeManifest;
 
 use crate::sandbox::{Sandbox, SandboxProfile, SandboxResult};
+
+use self::generic::GenericBackend;
+use self::java::JavaBackend;
+use self::traits::LanguageBackend;
 
 const DEFAULT_COMPILE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_JVM_COMPILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -34,6 +41,14 @@ const DEFAULT_JAVA_RUN_JVM_FLAGS: &[&str] = &[
     "-Xss256k",
 ];
 
+/// Select the appropriate [`LanguageBackend`] for a given language.
+fn backend_for(language: &str) -> Box<dyn LanguageBackend> {
+    match language {
+        "java" => Box::new(JavaBackend),
+        _ => Box::new(GenericBackend),
+    }
+}
+
 pub struct Evaluator {
     workspace_dir: PathBuf,
     runtime_dir: Option<PathBuf>,
@@ -57,31 +72,37 @@ impl Evaluator {
     }
 
     pub fn evaluate(&self, request: &JobRequest) -> SandboxResult<JobResult> {
-        let primary_file = request
-            .files
-            .first()
-            .and_then(|f| f.name.clone())
-            .unwrap_or_else(|| "main".to_string());
+        let backend = backend_for(&self.manifest.language);
 
-        // 1. Write files to workspace
-        for file in &request.files {
-            let name = file.name.as_deref().unwrap_or("main");
-            let path = self.workspace_dir.join(name);
-            fs::write(&path, &file.content)?;
-        }
+        // 1. Write files to workspace (language-specific)
+        let write_result = backend.write_files(&self.workspace_dir, &request.files)?;
+        let primary_file = &write_result.primary_file;
+        let class_name = write_result
+            .class_name
+            .as_deref()
+            .unwrap_or(primary_file.as_str());
+
+        // Helper closure: substitute placeholders in template args.
+        let substitute = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .map(|s| {
+                    s.replace("{file}", primary_file)
+                        .replace("{class}", class_name)
+                })
+                .collect()
+        };
 
         // 2. Compile if necessary
         let mut compile_result = None;
         if let Some(compile_template) = &self.manifest.compile {
             let mut compile_limits = self.limits.clone();
-            let default_compile_mem = if self.manifest.language == "java" {
-                DEFAULT_JVM_COMPILE_MEMORY_BYTES
-            } else {
-                DEFAULT_COMPILE_MEMORY_BYTES
-            };
-            compile_limits.memory_limit_bytes = request
-                .compile_memory_limit
-                .unwrap_or_else(|| compile_limits.memory_limit_bytes.max(default_compile_mem));
+
+            // Base compile-limit defaults.
+            compile_limits.memory_limit_bytes = request.compile_memory_limit.unwrap_or_else(|| {
+                compile_limits
+                    .memory_limit_bytes
+                    .max(DEFAULT_COMPILE_MEMORY_BYTES)
+            });
             compile_limits.output_limit_bytes = request.compile_output_limit.unwrap_or_else(|| {
                 compile_limits
                     .output_limit_bytes
@@ -91,6 +112,9 @@ impl Evaluator {
                 .compile_timeout
                 .unwrap_or_else(|| compile_limits.timeout_ms.max(DEFAULT_COMPILE_TIMEOUT_MS));
 
+            // Language-specific adjustments (e.g. JVM memory).
+            backend.adjust_compile_limits(&mut compile_limits, &self.manifest);
+
             let mut sandbox = Sandbox::new(
                 &compile_limits,
                 &self.workspace_dir,
@@ -99,35 +123,18 @@ impl Evaluator {
             )?;
 
             let cmd = &compile_template.command;
-            let compile_args_owned: Vec<String> = compile_template
+            let template_args = compile_template
                 .args
                 .as_ref()
-                .map(|a| {
-                    a.iter()
-                        .map(|s| s.replace("{file}", &primary_file))
-                        .collect::<Vec<_>>()
-                })
+                .map(|a| substitute(a))
                 .unwrap_or_default();
-            let compile_args: Vec<&str> = compile_args_owned.iter().map(|s| s.as_str()).collect();
 
-            // For javac, JVM flags must be prefixed with -J to avoid the
-            // "Picked up JAVA_TOOL_OPTIONS" stderr noise.
-            let java_compile_flags: Vec<String> = if self.manifest.language == "java" {
-                let flags: Vec<&str> = compile_template
-                    .jvm_flags
-                    .as_ref()
-                    .map(|v| v.iter().map(|s| s.as_str()).collect())
-                    .unwrap_or_else(|| DEFAULT_JAVA_COMPILE_JVM_FLAGS.to_vec());
-                flags.iter().map(|f| format!("-J{f}")).collect()
-            } else {
-                Vec::new()
-            };
-            let mut full_compile_args: Vec<&str> =
-                java_compile_flags.iter().map(|s| s.as_str()).collect();
-            full_compile_args.extend_from_slice(&compile_args);
+            let full_compile_args_owned =
+                backend.build_compile_args(template_args, &self.manifest);
+            let full_compile_args: Vec<&str> =
+                full_compile_args_owned.iter().map(|s| s.as_str()).collect();
 
             let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin"), ("HOME", "/tmp")];
-
             let timeout = compile_limits.timeout_ms;
 
             let result = sandbox.run(cmd, &full_compile_args, Some(&envs), None, timeout)?;
@@ -160,46 +167,20 @@ impl Evaluator {
             run_limits.timeout_ms = timeout;
         }
 
-        // JVM needs at least ~512 MB of virtual address space to start.
-        if self.manifest.language == "java" {
-            run_limits.memory_limit_bytes = run_limits
-                .memory_limit_bytes
-                .max(DEFAULT_JVM_RUN_MEMORY_BYTES);
-        }
+        // Language-specific run-limit adjustments.
+        backend.adjust_run_limits(&mut run_limits, &self.manifest);
 
         let cmd = &self.manifest.execute.command;
-        let run_args_owned: Vec<String> = self
+        let template_args = self
             .manifest
             .execute
             .args
             .as_ref()
-            .map(|a| {
-                a.iter()
-                    .map(|s| s.replace("{file}", &primary_file))
-                    .collect::<Vec<_>>()
-            })
+            .map(|a| substitute(a))
             .unwrap_or_default();
-        let run_args: Vec<&str> = run_args_owned.iter().map(|s| s.as_str()).collect();
 
-        // For java, pass JVM flags as direct CLI args (before the class name)
-        // to avoid the "Picked up JAVA_TOOL_OPTIONS" stderr noise.
-        let run_jvm_flags_owned: Vec<String> = if self.manifest.language == "java" {
-            self.manifest
-                .execute
-                .jvm_flags
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| {
-                    DEFAULT_JAVA_RUN_JVM_FLAGS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-        } else {
-            Vec::new()
-        };
-        let mut full_run_args: Vec<&str> = run_jvm_flags_owned.iter().map(|s| s.as_str()).collect();
-        full_run_args.extend_from_slice(&run_args);
+        let full_run_args_owned = backend.build_run_args(template_args, &self.manifest);
+        let full_run_args: Vec<&str> = full_run_args_owned.iter().map(|s| s.as_str()).collect();
 
         let envs = vec![("PATH", "/opt/runtime/bin:/usr/bin:/bin"), ("HOME", "/tmp")];
         let timeout = run_limits.timeout_ms;
