@@ -8,10 +8,7 @@ pub use zig::ZigInstaller;
 
 use std::path::Path;
 
-use crate::{
-    error::JetPackResult,
-    manifest::RuntimeManifest,
-};
+use crate::{error::JetPackResult, manifest::RuntimeManifest};
 
 /// Context passed to installer hooks during the install lifecycle.
 pub struct InstallContext<'a> {

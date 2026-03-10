@@ -338,10 +338,8 @@ impl Sandbox {
                 (Some(out), Some(err)) => std::thread::scope(|s| {
                     let h_out = s.spawn(|| read_pipe_limited(out, max_bytes));
                     let h_err = s.spawn(|| read_pipe_limited(err, max_bytes));
-                    let (out_data, out_trunc) =
-                        h_out.join().unwrap_or_else(|_| (vec![], false));
-                    let (err_data, err_trunc) =
-                        h_err.join().unwrap_or_else(|_| (vec![], false));
+                    let (out_data, out_trunc) = h_out.join().unwrap_or_else(|_| (vec![], false));
+                    let (err_data, err_trunc) = h_err.join().unwrap_or_else(|_| (vec![], false));
                     (out_data, out_trunc, err_data, err_trunc)
                 }),
             };
@@ -388,12 +386,12 @@ impl Sandbox {
         //   3. Memory-limit exceeded (heuristic on SIGKILL + peak RSS)
         //   4. Time-limit exceeded    (SIGKILL fallback)
         //   5. Runtime error
-        let is_sigkill = internal_code == 128 + libc::SIGKILL
-            || process_exit_code == Some(128 + libc::SIGKILL);
-        let is_sigxfsz = internal_code == 128 + libc::SIGXFSZ
-            || process_exit_code == Some(128 + libc::SIGXFSZ);
-        let is_sigabrt = internal_code == 128 + libc::SIGABRT
-            || process_exit_code == Some(128 + libc::SIGABRT);
+        let is_sigkill =
+            internal_code == 128 + libc::SIGKILL || process_exit_code == Some(128 + libc::SIGKILL);
+        let is_sigxfsz =
+            internal_code == 128 + libc::SIGXFSZ || process_exit_code == Some(128 + libc::SIGXFSZ);
+        let is_sigabrt =
+            internal_code == 128 + libc::SIGABRT || process_exit_code == Some(128 + libc::SIGABRT);
 
         // Heuristic: if peak memory ≥ 80 % of the cgroup limit the
         // process was almost certainly OOM-killed, not timed-out.
@@ -409,10 +407,7 @@ impl Sandbox {
             || stderr_lc.contains("cannot allocate memory");
         let stage_status = if is_success && !output_truncated {
             StageStatus::Success
-        } else if output_truncated
-            || reason_lc.contains("output limit exceeded")
-            || is_sigxfsz
-        {
+        } else if output_truncated || reason_lc.contains("output limit exceeded") || is_sigxfsz {
             StageStatus::OutputLimitExceeded
         } else if reason_lc.contains("cannot allocate memory")
             || reason_lc.contains("out of memory")

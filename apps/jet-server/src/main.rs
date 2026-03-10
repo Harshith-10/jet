@@ -23,6 +23,11 @@ const APALIS_QUEUE_NAMESPACE: &str = "jet_server::queue::QueuedJob";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = worker::supervisor::maybe_run_child_eval_mode(&args) {
+        std::process::exit(code);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

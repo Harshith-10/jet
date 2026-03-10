@@ -9,13 +9,13 @@ pub mod updater;
 
 pub use error::{JetPackError, JetPackResult};
 pub use installer::{
-    DefaultInstaller, JavaInstaller, RustInstaller, RuntimeInstaller, ZigInstaller,
+    DefaultInstaller, JavaInstaller, RuntimeInstaller, RustInstaller, ZigInstaller,
     get_installer_for,
 };
 pub use manager::{InstallResult, ManifestSource, PackageManager, ResolvedManifest};
 pub use manifest::{RuntimeArchive, RuntimeManifest};
 pub use resolver::{InMemoryVersionStore, RedisVersionStore, VersionResolver};
 pub use updater::{
-    JavaCorrettoUpdater, PythonStandaloneUpdater, RustUpdater, RuntimeUpdater, UpdateTarget,
+    JavaCorrettoUpdater, PythonStandaloneUpdater, RuntimeUpdater, RustUpdater, UpdateTarget,
     UpdatedManifest, ZigUpdater, get_updaters,
 };

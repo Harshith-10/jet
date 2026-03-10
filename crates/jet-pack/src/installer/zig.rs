@@ -1,9 +1,6 @@
 use std::path::Path;
 
-use crate::{
-    error::JetPackResult,
-    manager::prepare_zig_cache_dir,
-};
+use crate::{error::JetPackResult, manager::prepare_zig_cache_dir};
 
 use super::{InstallContext, RuntimeInstaller};
 

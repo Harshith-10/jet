@@ -169,11 +169,24 @@ mod tests {
 
         // Simulate rust-std component
         let std_dir = root.join("rust-std-x86_64-unknown-linux-gnu");
-        fs::create_dir_all(std_dir.join("lib").join("rustlib").join("x86_64-unknown-linux-gnu").join("lib")).unwrap();
+        fs::create_dir_all(
+            std_dir
+                .join("lib")
+                .join("rustlib")
+                .join("x86_64-unknown-linux-gnu")
+                .join("lib"),
+        )
+        .unwrap();
         fs::write(
-            std_dir.join("lib").join("rustlib").join("x86_64-unknown-linux-gnu").join("lib").join("libstd.rlib"),
+            std_dir
+                .join("lib")
+                .join("rustlib")
+                .join("x86_64-unknown-linux-gnu")
+                .join("lib")
+                .join("libstd.rlib"),
             "std-lib",
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(std_dir.join("manifest.in"), "std-manifest").unwrap();
 
         // Simulate cargo component
@@ -195,7 +208,14 @@ mod tests {
         assert!(root.join("bin").join("rustdoc").exists());
         assert!(root.join("bin").join("cargo").exists());
         assert!(root.join("lib").join("librustc_driver.so").exists());
-        assert!(root.join("lib").join("rustlib").join("x86_64-unknown-linux-gnu").join("lib").join("libstd.rlib").exists());
+        assert!(
+            root.join("lib")
+                .join("rustlib")
+                .join("x86_64-unknown-linux-gnu")
+                .join("lib")
+                .join("libstd.rlib")
+                .exists()
+        );
 
         // Verify cleanup
         assert!(!root.join("rustc").exists(), "rustc/ should be removed");

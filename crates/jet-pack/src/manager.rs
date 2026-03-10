@@ -83,12 +83,13 @@ impl PackageManager {
     ) -> JetPackResult<ResolvedManifest> {
         let resolver = self.build_resolver()?;
         let canonical_lang = resolver.canonical_language(language).to_owned();
-        let resolved_version = resolver.resolve(language, version)?.ok_or_else(|| {
-            JetPackError::ManifestNotFound {
-                language: language.to_string(),
-                version: version.to_string(),
-            }
-        })?;
+        let resolved_version =
+            resolver
+                .resolve(language, version)?
+                .ok_or_else(|| JetPackError::ManifestNotFound {
+                    language: language.to_string(),
+                    version: version.to_string(),
+                })?;
 
         let manifests = self.scan_manifests()?;
         let manifest = manifests

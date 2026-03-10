@@ -29,6 +29,10 @@ pub struct JobStateRecord {
     pub version: String,
     pub result: Option<JobResult>,
     pub error: Option<String>,
+    /// Final reason classification for terminal states.
+    /// Examples: success, timeout, queue_timeout, enqueue_failed, execution_error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
     /// How long the job waited in the queue before a worker picked it up (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_wait_ms: Option<u64>,

@@ -34,10 +34,9 @@ impl RuntimeUpdater for RustUpdater {
 /// Parses the Rust stable channel TOML and emits a single manifest for the
 /// latest stable version.
 pub fn parse_rust_channel_manifest(toml_text: &str) -> JetPackResult<Vec<UpdatedManifest>> {
-    let root: toml::Value =
-        toml::from_str(toml_text).map_err(|e| JetPackError::Serialization {
-            message: format!("failed to parse Rust channel TOML: {e}"),
-        })?;
+    let root: toml::Value = toml::from_str(toml_text).map_err(|e| JetPackError::Serialization {
+        message: format!("failed to parse Rust channel TOML: {e}"),
+    })?;
 
     // pkg.rust.version = "1.76.0 (07dca489a 2024-02-04)"
     let version_raw = root

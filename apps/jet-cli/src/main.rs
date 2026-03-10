@@ -694,11 +694,8 @@ fn runtimes_install(
 
     let lang_owned = language.to_string();
     let ver_owned = resolved.resolved_version.clone();
-    let installed = manager.install_runtime_with_progress(
-        &resolved.manifest,
-        arch,
-        &download_bar,
-        || {
+    let installed =
+        manager.install_runtime_with_progress(&resolved.manifest, arch, &download_bar, || {
             download_bar.finish_with_message(format!("{}Download complete", CHECKMARK));
             extract_spinner.set_draw_target(indicatif::ProgressDrawTarget::stderr());
             extract_spinner.set_message(format!(
@@ -707,8 +704,7 @@ fn runtimes_install(
                 style(&lang_owned).green(),
                 style(&ver_owned).yellow()
             ));
-        },
-    );
+        });
 
     match installed {
         Ok(path) => {

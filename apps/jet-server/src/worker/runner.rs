@@ -5,6 +5,7 @@ use apalis::prelude::*;
 use apalis_redis::RedisStorage;
 use deadpool_redis::{Pool, redis::AsyncCommands};
 use jet_core::models::ExecutionLimits;
+use jet_core::models::{JobResult, StageStatus};
 use jet_pack::manifest::RuntimeManifest;
 use tokio::fs;
 use tokio::sync::Semaphore;
@@ -14,7 +15,7 @@ use crate::{
     counters::saturating_decrement,
     path_safety::build_job_workspace_path,
     queue::{JobStateRecord, JobType, QueuedJob, job_state_key},
-    worker::evaluator::Evaluator,
+    worker::supervisor::{ChildEvalPayload, run_supervised_job},
 };
 
 #[derive(Clone)]
@@ -87,6 +88,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     "job waited {}ms in queue (max: {}ms)",
                     queue_wait_ms, data.max_queue_wait_ms
                 )),
+                terminal_reason: Some("queue_timeout".to_string()),
                 queue_wait_ms: Some(queue_wait_ms),
             },
         )
@@ -133,6 +135,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             version: job.version.clone(),
             result: None,
             error: None,
+            terminal_reason: None,
             queue_wait_ms: Some(queue_wait_ms),
         },
     )
@@ -166,6 +169,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     version: job.version.clone(),
                     result: Some(job_result.clone()),
                     error: None,
+                    terminal_reason: Some(terminal_reason_from_result(&job_result).to_string()),
                     queue_wait_ms: Some(queue_wait_ms),
                 },
             )
@@ -192,6 +196,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     version: job.version.clone(),
                     result: None,
                     error: Some(source.to_string()),
+                    terminal_reason: Some(classify_failure_reason(&source).to_string()),
                     queue_wait_ms: Some(queue_wait_ms),
                 },
             )
@@ -272,45 +277,43 @@ async fn process_job(
     let wall_clock_limit =
         std::time::Duration::from_millis(compile_ms + run_ms * num_testcases + 60_000);
 
-    // Run the evaluator on a blocking thread so it doesn't starve
-    // the async runtime while sandbox processes are executing.
-    let request = job.request.clone();
-    let ws = workspace_dir.clone();
-    let result = tokio::time::timeout(
+    // Run each job in a supervised child process so wall-clock timeouts can
+    // terminate the actual process tree, not just the async future.
+    let result = run_supervised_job(
+        ChildEvalPayload {
+            request: job.request.clone(),
+            workspace_dir: workspace_dir.clone(),
+            runtime_root_dir,
+            zig_cache_dir,
+            manifest,
+            limits,
+        },
         wall_clock_limit,
-        tokio::task::spawn_blocking(move || {
-            let evaluator =
-                Evaluator::new(ws, Some(runtime_root_dir), zig_cache_dir, manifest, limits);
-            evaluator
-                .evaluate(&request)
-                .map_err(|source| std::io::Error::other(source.to_string()))
-        }),
     )
-    .await;
-
-    let result = match result {
-        Ok(inner) => inner
-            .map_err(|e| std::io::Error::other(format!("spawn_blocking join error: {e}"))),
-        Err(_elapsed) => {
+    .await
+    .map_err(|source| {
+        if source.kind() == std::io::ErrorKind::TimedOut {
             warn!(
                 job_id = %job.id,
                 wall_clock_limit_ms = wall_clock_limit.as_millis() as u64,
-                "job exceeded wall-clock limit — aborting"
+                error = %source,
+                "job exceeded wall-clock limit and child process group was killed"
             );
-            Err(std::io::Error::other(format!(
-                "job exceeded wall-clock limit of {}s",
-                wall_clock_limit.as_secs()
-            )))
         }
-    };
+        source
+    });
 
     // Always clean up workspace, regardless of success or failure.
     cleanup_workspace(&jobs_root, &workspace_dir, &job.id).await;
 
-    result?
+    result
 }
 
-async fn cleanup_workspace(jobs_root: &std::path::Path, workspace_dir: &std::path::Path, job_id: &str) {
+async fn cleanup_workspace(
+    jobs_root: &std::path::Path,
+    workspace_dir: &std::path::Path,
+    job_id: &str,
+) {
     let canonical_jobs_root = match tokio::fs::canonicalize(jobs_root).await {
         Ok(path) => path,
         Err(e) => {
@@ -359,11 +362,85 @@ fn normalize_arch(arch: &str) -> &str {
     }
 }
 
+fn classify_failure_reason(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        return "timeout";
+    }
+
+    if error.kind() == std::io::ErrorKind::BrokenPipe
+        || error.kind() == std::io::ErrorKind::Interrupted
+    {
+        return "worker_lost";
+    }
+
+    "execution_error"
+}
+
+fn terminal_reason_from_result(result: &JobResult) -> &'static str {
+    if is_stage_status(&result.compile, StageStatus::TimeLimitExceeded) {
+        return "compile_timeout";
+    }
+    if is_stage_status(&result.run, StageStatus::TimeLimitExceeded)
+        || has_testcase_stage_status(result, StageStatus::TimeLimitExceeded)
+    {
+        return "run_timeout";
+    }
+
+    if is_stage_status(&result.compile, StageStatus::MemoryLimitExceeded) {
+        return "compile_oom";
+    }
+    if is_stage_status(&result.run, StageStatus::MemoryLimitExceeded)
+        || has_testcase_stage_status(result, StageStatus::MemoryLimitExceeded)
+    {
+        return "run_oom";
+    }
+
+    if is_stage_status(&result.compile, StageStatus::OutputLimitExceeded) {
+        return "compile_output_limit";
+    }
+    if is_stage_status(&result.run, StageStatus::OutputLimitExceeded)
+        || has_testcase_stage_status(result, StageStatus::OutputLimitExceeded)
+    {
+        return "run_output_limit";
+    }
+
+    if is_stage_status(&result.compile, StageStatus::CompilationError) {
+        return "compilation_error";
+    }
+    if is_stage_status(&result.run, StageStatus::RuntimeError)
+        || has_testcase_stage_status(result, StageStatus::RuntimeError)
+    {
+        return "runtime_error";
+    }
+
+    if let Some(testcases) = &result.testcases {
+        if testcases.iter().any(|tc| !tc.passed) {
+            return "wrong_answer";
+        }
+    }
+
+    "success"
+}
+
+fn is_stage_status(stage: &Option<jet_core::models::StageResult>, status: StageStatus) -> bool {
+    stage.as_ref().map(|s| s.status == status).unwrap_or(false)
+}
+
+fn has_testcase_stage_status(result: &JobResult, status: StageStatus) -> bool {
+    result
+        .testcases
+        .as_ref()
+        .map(|cases| cases.iter().any(|tc| tc.run_details.status == status))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::normalize_arch;
+    use jet_core::models::{JobResult, StageResult, StageStatus, TestcaseResult};
+
+    use super::{classify_failure_reason, normalize_arch};
     use crate::counters::saturating_decrement;
 
     #[test]
@@ -386,6 +463,68 @@ mod tests {
         saturating_decrement(&counter);
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn classifies_timeout_failures() {
+        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert_eq!(classify_failure_reason(&err), "timeout");
+    }
+
+    #[test]
+    fn classifies_broken_pipe_as_worker_lost() {
+        let err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "child output missing");
+        assert_eq!(classify_failure_reason(&err), "worker_lost");
+    }
+
+    #[test]
+    fn classifies_interrupted_as_worker_lost() {
+        let err = std::io::Error::new(std::io::ErrorKind::Interrupted, "worker cancelled");
+        assert_eq!(classify_failure_reason(&err), "worker_lost");
+    }
+
+    #[test]
+    fn derives_compile_timeout_terminal_reason() {
+        let result = JobResult {
+            language: "rust".to_string(),
+            version: "1.76.0".to_string(),
+            run: None,
+            compile: Some(stage(StageStatus::TimeLimitExceeded)),
+            testcases: None,
+        };
+
+        assert_eq!(super::terminal_reason_from_result(&result), "compile_timeout");
+    }
+
+    #[test]
+    fn derives_run_timeout_terminal_reason_from_testcases() {
+        let result = JobResult {
+            language: "python".to_string(),
+            version: "3.14.3".to_string(),
+            run: None,
+            compile: Some(stage(StageStatus::Success)),
+            testcases: Some(vec![TestcaseResult {
+                id: "tc-1".to_string(),
+                passed: false,
+                actual_output: String::new(),
+                run_details: stage(StageStatus::TimeLimitExceeded),
+            }]),
+        };
+
+        assert_eq!(super::terminal_reason_from_result(&result), "run_timeout");
+    }
+
+    fn stage(status: StageStatus) -> StageResult {
+        StageResult {
+            status,
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            signal: None,
+            memory_usage: None,
+            cpu_time: None,
+            execution_time: None,
+        }
     }
 }
 

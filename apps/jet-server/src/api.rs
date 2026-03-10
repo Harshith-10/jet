@@ -375,6 +375,7 @@ async fn submit_job(
         version: resolved.clone(),
         result: None,
         error: None,
+        terminal_reason: None,
         queue_wait_ms: None,
     };
 
@@ -604,7 +605,10 @@ async fn read_idempotency_record(
 ) -> Result<Option<IdempotencyRecord>, (StatusCode, String)> {
     let key = idempotency_state_key(&state.job_state_prefix, idempotency_key);
     let mut conn = state.redis_pool.get().await.map_err(internal_error)?;
-    let raw: Option<String> = conn.get::<_, Option<String>>(&key).await.map_err(internal_error)?;
+    let raw: Option<String> = conn
+        .get::<_, Option<String>>(&key)
+        .await
+        .map_err(internal_error)?;
 
     raw.map(|payload| serde_json::from_str::<IdempotencyRecord>(&payload).map_err(internal_error))
         .transpose()
@@ -617,7 +621,11 @@ async fn write_idempotency_record(
 ) -> Result<(), String> {
     let key = idempotency_state_key(&state.job_state_prefix, idempotency_key);
     let payload = serde_json::to_string(record).map_err(|source| source.to_string())?;
-    let mut conn = state.redis_pool.get().await.map_err(|source| source.to_string())?;
+    let mut conn = state
+        .redis_pool
+        .get()
+        .await
+        .map_err(|source| source.to_string())?;
 
     let _: () = conn
         .set::<_, _, ()>(&key, &payload)
@@ -634,7 +642,11 @@ async fn write_idempotency_record(
 async fn write_api_job_state(state: &ApiState, record: &JobStateRecord) -> Result<(), String> {
     let state_key = job_state_key(&state.job_state_prefix, &record.job_id);
     let payload = serde_json::to_string(record).map_err(|source| source.to_string())?;
-    let mut conn = state.redis_pool.get().await.map_err(|source| source.to_string())?;
+    let mut conn = state
+        .redis_pool
+        .get()
+        .await
+        .map_err(|source| source.to_string())?;
 
     let _: () = conn
         .set::<_, _, ()>(&state_key, &payload)
@@ -662,6 +674,7 @@ async fn reconcile_enqueue_failure_state(
         version: version.to_string(),
         result: None,
         error: Some(format!("job was not enqueued: {error}")),
+        terminal_reason: Some("enqueue_failed".to_string()),
         queue_wait_ms: None,
     };
 
@@ -834,6 +847,7 @@ mod tests {
             version: "3.14.3".to_string(),
             result: None,
             error: None,
+            terminal_reason: Some("success".to_string()),
             queue_wait_ms: None,
         };
         let payload = serde_json::to_string(&record).expect("serialize record");
@@ -894,9 +908,10 @@ mod tests {
             compile_output_limit: None,
         };
 
-        let (status, response) = submit_job(State(state.clone()), HeaderMap::new(), axum::Json(request))
-            .await
-            .expect("submit should succeed");
+        let (status, response) =
+            submit_job(State(state.clone()), HeaderMap::new(), axum::Json(request))
+                .await
+                .expect("submit should succeed");
 
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_ne!(response.job_id, "../../escape");
@@ -945,7 +960,12 @@ mod tests {
             .expect_err("submit should fail");
 
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(state.jobs_in_flight.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            state
+                .jobs_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert_eq!(queue.len().await, 0);
 
         let attempted_job_ids = queue.attempted_job_ids().await;
@@ -953,16 +973,21 @@ mod tests {
 
         let mut conn = state.redis_pool.get().await.expect("pool conn");
         let stored: Option<String> = conn
-            .get(job_state_key(&state.job_state_prefix, &attempted_job_ids[0]))
+            .get(job_state_key(
+                &state.job_state_prefix,
+                &attempted_job_ids[0],
+            ))
             .await
             .expect("state lookup");
         let stored = stored.expect("failed enqueue state should remain queryable");
         let stored: JobStateRecord = serde_json::from_str(&stored).expect("decode state");
         assert_eq!(stored.status, "failed");
-        assert!(stored
-            .error
-            .expect("failed state should include error")
-            .contains("job was not enqueued"));
+        assert!(
+            stored
+                .error
+                .expect("failed state should include error")
+                .contains("job was not enqueued")
+        );
 
         let _ = shutdown_tx.send(());
     }
