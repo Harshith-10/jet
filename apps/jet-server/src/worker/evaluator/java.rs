@@ -4,6 +4,8 @@ use std::path::Path;
 use jet_core::models::{ExecutionLimits, FileRequest};
 use jet_pack::RuntimeManifest;
 
+use crate::path_safety::prepare_workspace_file_path;
+
 use super::traits::{LanguageBackend, WriteResult};
 use super::{
     DEFAULT_JAVA_COMPILE_JVM_FLAGS, DEFAULT_JAVA_RUN_JVM_FLAGS, DEFAULT_JVM_COMPILE_MEMORY_BYTES,
@@ -117,10 +119,11 @@ impl LanguageBackend for JavaBackend {
                 let target_class = extracted.unwrap_or_else(|| "Main".to_string());
                 let target_file = format!("{target_class}.java");
 
-                let path = workspace.join(&target_file);
+                let (path, relative_name) =
+                    prepare_workspace_file_path(workspace, Some(&target_file), &target_file)?;
                 fs::write(&path, &file.content)?;
 
-                primary_file = target_file;
+                primary_file = relative_name;
                 class_name = Some(target_class);
             } else {
                 // Secondary files: save under their original name, or try
@@ -132,7 +135,7 @@ impl LanguageBackend for JavaBackend {
                     let cls = extracted.unwrap_or_else(|| format!("File{i}"));
                     format!("{cls}.java")
                 };
-                let path = workspace.join(&target);
+                let (path, _) = prepare_workspace_file_path(workspace, Some(&target), &target)?;
                 fs::write(&path, &file.content)?;
             }
         }
@@ -315,5 +318,31 @@ public class Calculator {
         assert_eq!(result.primary_file, "Calculator.java");
         assert_eq!(result.class_name, Some("Calculator".to_string()));
         assert!(tmp.path().join("Calculator.java").exists());
+    }
+
+    #[test]
+    fn rejects_unsafe_secondary_file_names() {
+        let backend = JavaBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            jet_core::models::FileRequest {
+                name: Some("Main.java".to_string()),
+                content: r#"
+public class Main {
+    public static void main(String[] args) {}
+}
+"#
+                .to_string(),
+                encoding: None,
+            },
+            jet_core::models::FileRequest {
+                name: Some("../../escape.java".to_string()),
+                content: "class Escape {}".to_string(),
+                encoding: None,
+            },
+        ];
+
+        let err = backend.write_files(tmp.path(), &files).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

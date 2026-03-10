@@ -11,6 +11,8 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 mod api;
+mod counters;
+mod path_safety;
 mod queue;
 mod sandbox;
 mod worker;

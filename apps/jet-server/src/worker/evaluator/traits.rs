@@ -4,6 +4,7 @@ use jet_core::models::{ExecutionLimits, FileRequest};
 use jet_pack::RuntimeManifest;
 
 /// Result of writing source files to the workspace.
+#[derive(Debug)]
 pub struct WriteResult {
     /// The "primary" file name (e.g. `main.c`, `HelloWorld.java`).
     pub primary_file: String,

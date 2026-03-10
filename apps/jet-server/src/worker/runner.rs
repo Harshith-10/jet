@@ -11,6 +11,8 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::{
+    counters::saturating_decrement,
+    path_safety::build_job_workspace_path,
     queue::{JobStateRecord, JobType, QueuedJob, job_state_key},
     worker::evaluator::Evaluator,
 };
@@ -71,7 +73,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             "shedding stale job: exceeded max queue wait time"
         );
         data.jobs_failed.fetch_add(1, Ordering::Relaxed);
-        data.jobs_in_flight.fetch_sub(1, Ordering::Relaxed);
+        saturating_decrement(&data.jobs_in_flight);
         write_job_state(
             &data.redis_pool,
             &data.job_state_prefix,
@@ -141,7 +143,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
     let elapsed = start.elapsed();
 
     // Release category counter (semaphore permit drops automatically).
-    category_counter.fetch_sub(1, Ordering::Relaxed);
+    saturating_decrement(&category_counter);
 
     match result {
         Ok(job_result) => {
@@ -153,7 +155,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                 "job completed successfully"
             );
             data.jobs_completed.fetch_add(1, Ordering::Relaxed);
-            data.jobs_in_flight.fetch_sub(1, Ordering::Relaxed);
+            saturating_decrement(&data.jobs_in_flight);
             write_job_state(
                 &data.redis_pool,
                 &data.job_state_prefix,
@@ -179,7 +181,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                 "job failed"
             );
             data.jobs_failed.fetch_add(1, Ordering::Relaxed);
-            data.jobs_in_flight.fetch_sub(1, Ordering::Relaxed);
+            saturating_decrement(&data.jobs_in_flight);
             write_job_state(
                 &data.redis_pool,
                 &data.job_state_prefix,
@@ -236,7 +238,9 @@ async fn process_job(
     // that avoids the ~10 s header-decompression penalty inside the sandbox.
     let zig_cache_dir = jet_pack::manager::zig_cache_dir_for(&runtime_root_dir);
 
-    let workspace_dir = data.runtime_install_dir.join("jobs").join(&job.id);
+    let jobs_root = data.runtime_install_dir.join("jobs");
+    let workspace_dir = build_job_workspace_path(&jobs_root, &job.id)
+        .map_err(|source| std::io::Error::other(source.to_string()))?;
     fs::create_dir_all(&workspace_dir)
         .await
         .map_err(|source| std::io::Error::other(source.to_string()))?;
@@ -301,13 +305,40 @@ async fn process_job(
     };
 
     // Always clean up workspace, regardless of success or failure.
-    cleanup_workspace(&workspace_dir, &job.id).await;
+    cleanup_workspace(&jobs_root, &workspace_dir, &job.id).await;
 
     result?
 }
 
-async fn cleanup_workspace(workspace_dir: &std::path::Path, job_id: &str) {
-    if let Err(e) = fs::remove_dir_all(workspace_dir).await {
+async fn cleanup_workspace(jobs_root: &std::path::Path, workspace_dir: &std::path::Path, job_id: &str) {
+    let canonical_jobs_root = match tokio::fs::canonicalize(jobs_root).await {
+        Ok(path) => path,
+        Err(e) => {
+            warn!(job_id = %job_id, error = %e, "failed to resolve jobs root for cleanup");
+            return;
+        }
+    };
+
+    let canonical_workspace = match tokio::fs::canonicalize(workspace_dir).await {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(job_id = %job_id, error = %e, "failed to resolve workspace for cleanup");
+            return;
+        }
+    };
+
+    if !canonical_workspace.starts_with(&canonical_jobs_root) {
+        warn!(
+            job_id = %job_id,
+            workspace = %canonical_workspace.display(),
+            jobs_root = %canonical_jobs_root.display(),
+            "refusing to cleanup workspace outside configured jobs root"
+        );
+        return;
+    }
+
+    if let Err(e) = fs::remove_dir_all(&canonical_workspace).await {
         // Ignore NotFound — the workspace may never have been created
         // (e.g. manifest validation failed before create_dir_all).
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -330,13 +361,31 @@ fn normalize_arch(arch: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::normalize_arch;
+    use crate::counters::saturating_decrement;
 
     #[test]
     fn normalizes_common_arch_aliases() {
         assert_eq!(normalize_arch("amd64"), "x86_64");
         assert_eq!(normalize_arch("arm64"), "aarch64");
         assert_eq!(normalize_arch("x86_64"), "x86_64");
+    }
+
+    #[test]
+    fn saturating_decrement_never_underflows() {
+        let counter = AtomicU64::new(0);
+
+        saturating_decrement(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        counter.store(2, Ordering::Relaxed);
+        saturating_decrement(&counter);
+        saturating_decrement(&counter);
+        saturating_decrement(&counter);
+
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }
 
