@@ -60,9 +60,10 @@ pub async fn run_supervised_job(
         Ok(bytes) => bytes,
         Err(e) => {
             cleanup_supervisor_artifacts(&input_path, &output_path);
-            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!(
-                "child exited with status {status} but output was missing: {e}"
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("child exited with status {status} but output was missing: {e}"),
+            ));
         }
     };
 
@@ -251,9 +252,10 @@ mod tests {
         let leader_pid = child.id().expect("child pid");
 
         let start = Instant::now();
-        let err = wait_for_supervised_exit(&mut child, Some(leader_pid), Duration::from_millis(500))
-            .await
-            .expect_err("supervised wait should time out");
+        let err =
+            wait_for_supervised_exit(&mut child, Some(leader_pid), Duration::from_millis(500))
+                .await
+                .expect_err("supervised wait should time out");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(5));

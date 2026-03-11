@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use apalis::prelude::TaskSink;
@@ -14,15 +15,20 @@ use apalis_redis::RedisStorage;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
 use deadpool_redis::{Pool, redis::AsyncCommands};
+use hmac::{Hmac, Mac};
 use jet_core::models::JobRequest;
 use jet_pack::{VersionResolver, manifest::RuntimeManifest};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+    GovernorLayer,
+    errors::GovernorError,
+    governor::GovernorConfigBuilder,
+    key_extractor::{KeyExtractor, SmartIpKeyExtractor},
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -99,6 +105,11 @@ pub struct ApiState {
     pub execute_concurrency: usize,
     /// Max queue wait time before shedding (seconds).
     pub max_queue_wait_secs: u64,
+    /// Optional shared secret used to validate signed user identity headers
+    /// for per-user rate limiting.
+    pub rate_limit_hmac_secret: Option<Arc<[u8]>>,
+    /// Max accepted absolute timestamp skew for signed rate-limit headers.
+    pub rate_limit_timestamp_tolerance_secs: i64,
 }
 
 const MAX_FILES: usize = 10;
@@ -106,9 +117,76 @@ const MAX_TESTCASES: usize = 1000;
 const MAX_TOTAL_FILE_SIZE: usize = 5 * 1024 * 1024; // 5 MB
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+const RATE_LIMIT_USER_HEADER: &str = "x-jet-user-id";
+const RATE_LIMIT_TIMESTAMP_HEADER: &str = "x-jet-timestamp";
+const RATE_LIMIT_SIGNATURE_HEADER: &str = "x-jet-signature";
 
 /// TTL for job state keys set from the API side.
 const JOB_STATE_TTL_SECS: i64 = 3600; // 1 hour
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone)]
+struct JetRateLimitKeyExtractor {
+    shared_secret: Option<Arc<[u8]>>,
+    max_skew_secs: i64,
+}
+
+impl JetRateLimitKeyExtractor {
+    fn signed_user_key<T>(&self, req: &Request<T>) -> Option<String> {
+        let secret = self.shared_secret.as_ref()?;
+        let headers = req.headers();
+
+        let user_id = headers
+            .get(RATE_LIMIT_USER_HEADER)
+            .and_then(|v| v.to_str().ok())?
+            .trim();
+        if user_id.is_empty() {
+            return None;
+        }
+
+        let ts_raw = headers
+            .get(RATE_LIMIT_TIMESTAMP_HEADER)
+            .and_then(|v| v.to_str().ok())?
+            .trim();
+        let timestamp = ts_raw.parse::<i64>().ok()?;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+        if (now - timestamp).abs() > self.max_skew_secs {
+            return None;
+        }
+
+        let sig_hex = headers
+            .get(RATE_LIMIT_SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())?
+            .trim();
+        let sig_bytes = hex::decode(sig_hex).ok()?;
+
+        let mut mac = HmacSha256::new_from_slice(secret.as_ref()).ok()?;
+        mac.update(user_id.as_bytes());
+        mac.update(b"\n");
+        mac.update(ts_raw.as_bytes());
+
+        if mac.verify_slice(&sig_bytes).is_ok() {
+            Some(user_id.to_string())
+        } else {
+            None
+        }
+    }
+}
+
+impl KeyExtractor for JetRateLimitKeyExtractor {
+    type Key = String;
+
+    fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
+        if let Some(user_id) = self.signed_user_key(req) {
+            return Ok(format!("user:{user_id}"));
+        }
+
+        let ip = SmartIpKeyExtractor.extract(req)?;
+        Ok(format!("ip:{ip}"))
+    }
+}
 
 fn validate_job_request(req: &JobRequest) -> Result<(), (StatusCode, String)> {
     if req.files.is_empty() {
@@ -202,16 +280,20 @@ pub struct StatsResponse {
 }
 
 pub fn router(state: ApiState) -> Router {
-    // Strict Rate limiting: 1 request per second per IP, burst of 3.
-    // Uses SmartIpKeyExtractor to respect X-Forwarded-For / X-Real-IP
-    // headers from reverse proxies.
+    // Strict rate limiting: 1 request per second, burst of 3.
+    // Keying strategy: signed `x-jet-user-id` first, then fallback to smart IP.
     //
     // NOTE: GovernorConfigBuilder::per_second(n) means "replenish 1 token
     // every n seconds", NOT "n tokens per second".
+    let key_extractor = JetRateLimitKeyExtractor {
+        shared_secret: state.rate_limit_hmac_secret.clone(),
+        max_skew_secs: state.rate_limit_timestamp_tolerance_secs,
+    };
+
     let strict_conf = GovernorConfigBuilder::default()
         .per_second(1)
         .burst_size(3)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(key_extractor.clone())
         .finish()
         .unwrap();
 
@@ -225,12 +307,12 @@ pub fn router(state: ApiState) -> Router {
         }
     });
 
-    // General Rate limiting: 5 requests per second per IP, burst of 10.
+    // General rate limiting: 5 requests per second, burst of 10.
     // per_millisecond(200) = 1 token every 200ms = 5 tokens/second.
     let general_conf = GovernorConfigBuilder::default()
         .per_millisecond(200)
         .burst_size(10)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(key_extractor)
         .finish()
         .unwrap();
 
@@ -691,28 +773,45 @@ async fn reconcile_enqueue_failure_state(
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
+        net::SocketAddr,
         pin::Pin,
         sync::{Arc, atomic::AtomicU64},
         time::Instant,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
         extract::Path,
         extract::State,
-        http::{HeaderMap, HeaderValue, StatusCode},
+        http::{HeaderMap, HeaderValue, Request, StatusCode},
     };
     use deadpool_redis::{Config as PoolConfig, Runtime as PoolRuntime, redis::AsyncCommands};
+    use hmac::{Hmac, Mac};
     use jet_core::models::{FileRequest, JobRequest};
     use jet_pack::{InMemoryVersionStore, RuntimeArchive, manifest::ExecutionTemplate};
     use mini_redis::server;
+    use sha2::Sha256;
     use tokio::{
         net::TcpListener,
         sync::{Mutex, oneshot},
     };
+    use tower_governor::key_extractor::KeyExtractor;
 
-    use super::{ApiState, IDEMPOTENCY_HEADER, JobQueue, get_job, submit_job};
+    use super::{
+        ApiState, IDEMPOTENCY_HEADER, JetRateLimitKeyExtractor, JobQueue, get_job, submit_job,
+    };
     use crate::queue::{JobStateRecord, QueuedJob, job_state_key};
     use jet_pack::{VersionResolver, manifest::RuntimeManifest};
+
+    type TestHmacSha256 = Hmac<Sha256>;
+
+    fn sign_user_header(secret: &[u8], user_id: &str, timestamp: i64) -> String {
+        let mut mac = TestHmacSha256::new_from_slice(secret).expect("valid hmac key");
+        mac.update(user_id.as_bytes());
+        mac.update(b"\n");
+        mac.update(timestamp.to_string().as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
 
     #[derive(Default)]
     struct MockQueue {
@@ -831,6 +930,8 @@ mod tests {
             compile_concurrency: 1,
             execute_concurrency: 1,
             max_queue_wait_secs: 30,
+            rate_limit_hmac_secret: None,
+            rate_limit_timestamp_tolerance_secs: 300,
         };
 
         (state, queue, shutdown_tx)
@@ -869,6 +970,51 @@ mod tests {
         assert_eq!(body.status, "completed");
 
         let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn extractor_prefers_valid_signed_user_id_key() {
+        let secret: Arc<[u8]> = Arc::from(b"test-secret".to_vec().into_boxed_slice());
+        let extractor = JetRateLimitKeyExtractor {
+            shared_secret: Some(secret.clone()),
+            max_skew_secs: 300,
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("valid clock")
+            .as_secs() as i64;
+        let sig = sign_user_header(secret.as_ref(), "user-123", now);
+
+        let req = Request::builder()
+            .header("x-jet-user-id", "user-123")
+            .header("x-jet-timestamp", now.to_string())
+            .header("x-jet-signature", sig)
+            .body(())
+            .expect("request build");
+
+        let key = extractor.extract(&req).expect("key extraction should work");
+        assert_eq!(key, "user:user-123");
+    }
+
+    #[test]
+    fn extractor_falls_back_to_ip_when_signature_invalid() {
+        let extractor = JetRateLimitKeyExtractor {
+            shared_secret: Some(Arc::from(b"test-secret".to_vec().into_boxed_slice())),
+            max_skew_secs: 300,
+        };
+
+        let mut req = Request::builder()
+            .header("x-jet-user-id", "user-123")
+            .header("x-jet-timestamp", "1")
+            .header("x-jet-signature", "deadbeef")
+            .body(())
+            .expect("request build");
+        req.extensions_mut()
+            .insert("10.2.3.4:8080".parse::<SocketAddr>().expect("socket addr"));
+
+        let key = extractor.extract(&req).expect("ip fallback should work");
+        assert_eq!(key, "ip:10.2.3.4");
     }
 
     #[tokio::test]

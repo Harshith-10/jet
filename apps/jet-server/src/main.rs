@@ -138,6 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| cpu_cores.saturating_sub(compile_concurrency).max(1));
 
+    let rate_limit_hmac_secret = std::env::var("JET_RATE_LIMIT_HMAC_SECRET")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| Arc::<[u8]>::from(v.into_bytes()));
+
+    let rate_limit_timestamp_tolerance_secs =
+        std::env::var("JET_RATE_LIMIT_TIMESTAMP_TOLERANCE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(300);
+
     let worker_concurrency = compile_concurrency + execute_concurrency;
 
     // Maximum queue depth before rejecting new submissions (backpressure).
@@ -178,6 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compile_concurrency,
         execute_concurrency,
         max_queue_wait_secs,
+        rate_limit_hmac_secret,
+        rate_limit_timestamp_tolerance_secs,
     };
 
     let worker_context = worker::runner::WorkerContext {

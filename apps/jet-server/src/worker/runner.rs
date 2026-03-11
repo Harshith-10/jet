@@ -493,7 +493,10 @@ mod tests {
             testcases: None,
         };
 
-        assert_eq!(super::terminal_reason_from_result(&result), "compile_timeout");
+        assert_eq!(
+            super::terminal_reason_from_result(&result),
+            "compile_timeout"
+        );
     }
 
     #[test]
