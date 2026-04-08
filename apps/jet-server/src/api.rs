@@ -14,8 +14,11 @@ use apalis::prelude::TaskSink;
 use apalis_redis::RedisStorage;
 use axum::{
     Json, Router,
+    body::{Body, to_bytes},
+    middleware::{self, Next},
     extract::{Path, State},
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode},
+    response::Response,
     routing::{get, post},
 };
 use deadpool_redis::{Pool, redis::AsyncCommands};
@@ -23,7 +26,7 @@ use hmac::{Hmac, Mac};
 use jet_core::models::JobRequest;
 use jet_pack::{VersionResolver, manifest::RuntimeManifest};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tower_governor::{
     GovernorLayer,
     errors::GovernorError,
@@ -31,6 +34,7 @@ use tower_governor::{
     key_extractor::{KeyExtractor, SmartIpKeyExtractor},
 };
 use tracing::{info, warn};
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
@@ -105,11 +109,24 @@ pub struct ApiState {
     pub execute_concurrency: usize,
     /// Max queue wait time before shedding (seconds).
     pub max_queue_wait_secs: u64,
-    /// Optional shared secret used to validate signed user identity headers
+    /// Key identifier for HMAC v2 request signing.
+    pub rate_limit_hmac_key_id: Option<String>,
+    /// Shared secret used to validate signed user identity headers
     /// for per-user rate limiting.
     pub rate_limit_hmac_secret: Option<Arc<[u8]>>,
     /// Max accepted absolute timestamp skew for signed rate-limit headers.
     pub rate_limit_timestamp_tolerance_secs: i64,
+    /// Nonce replay protection TTL in seconds.
+    pub rate_limit_nonce_ttl_secs: u64,
+    /// Strict limiter: one token replenished every N seconds.
+    pub strict_rate_limit_token_interval_secs: u64,
+    pub strict_rate_limit_burst: u32,
+    /// General limiter: one token replenished every N milliseconds.
+    pub general_rate_limit_token_interval_ms: u64,
+    pub general_rate_limit_burst: u32,
+    /// Poll limiter: one token replenished every N milliseconds.
+    pub poll_rate_limit_token_interval_ms: u64,
+    pub poll_rate_limit_burst: u32,
 }
 
 const MAX_FILES: usize = 10;
@@ -117,61 +134,119 @@ const MAX_TESTCASES: usize = 1000;
 const MAX_TOTAL_FILE_SIZE: usize = 5 * 1024 * 1024; // 5 MB
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+const AUTH_VERSION_HEADER: &str = "x-jet-auth-version";
+const AUTH_VERSION_V2: &str = "2";
+const AUTH_KEY_ID_HEADER: &str = "x-jet-key-id";
 const RATE_LIMIT_USER_HEADER: &str = "x-jet-user-id";
 const RATE_LIMIT_TIMESTAMP_HEADER: &str = "x-jet-timestamp";
+const RATE_LIMIT_NONCE_HEADER: &str = "x-jet-nonce";
+const RATE_LIMIT_CONTENT_SHA256_HEADER: &str = "x-jet-content-sha256";
 const RATE_LIMIT_SIGNATURE_HEADER: &str = "x-jet-signature";
+const HMAC_V2_CANONICAL_PREFIX: &str = "jet-hmac-v2";
+const MAX_NONCE_LEN: usize = 128;
+const NONCE_REPLAY_KEY_PREFIX: &str = "jet:auth:nonce";
+const MAX_AUTH_BODY_BYTES: usize = 50 * 1024 * 1024;
 
 /// TTL for job state keys set from the API side.
 const JOB_STATE_TTL_SECS: i64 = 3600; // 1 hour
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Clone, Debug)]
+struct AuthenticatedUserId(String);
+
+#[derive(Clone, Copy, Debug)]
+enum SignedHeaderError {
+    MissingAuthVersion,
+    UnsupportedAuthVersion,
+    MissingKeyId,
+    UnknownKeyId,
+    MissingSecret,
+    MissingUserId,
+    EmptyUserId,
+    MissingTimestamp,
+    InvalidTimestamp,
+    TimestampOutOfRange,
+    MissingNonce,
+    InvalidNonce,
+    MissingContentSha256,
+    InvalidContentSha256,
+    MissingContentType,
+    MissingSignature,
+    InvalidSignatureEncoding,
+    SignatureMismatch,
+    BodyHashMismatch,
+    NonceReplay,
+    BodyReadFailed,
+    RedisUnavailable,
+    ClockUnavailable,
+    HmacInitialization,
+}
+
+impl SignedHeaderError {
+    fn reason_code(self) -> &'static str {
+        match self {
+            SignedHeaderError::MissingAuthVersion => "missing_auth_version",
+            SignedHeaderError::UnsupportedAuthVersion => "unsupported_auth_version",
+            SignedHeaderError::MissingKeyId => "missing_key_id",
+            SignedHeaderError::UnknownKeyId => "unknown_key_id",
+            SignedHeaderError::MissingSecret => "missing_secret",
+            SignedHeaderError::MissingUserId => "missing_user_id",
+            SignedHeaderError::EmptyUserId => "empty_user_id",
+            SignedHeaderError::MissingTimestamp => "missing_timestamp",
+            SignedHeaderError::InvalidTimestamp => "invalid_timestamp",
+            SignedHeaderError::TimestampOutOfRange => "timestamp_out_of_range",
+            SignedHeaderError::MissingNonce => "missing_nonce",
+            SignedHeaderError::InvalidNonce => "invalid_nonce",
+            SignedHeaderError::MissingContentSha256 => "missing_content_sha256",
+            SignedHeaderError::InvalidContentSha256 => "invalid_content_sha256",
+            SignedHeaderError::MissingContentType => "missing_content_type",
+            SignedHeaderError::MissingSignature => "missing_signature",
+            SignedHeaderError::InvalidSignatureEncoding => "invalid_signature_encoding",
+            SignedHeaderError::SignatureMismatch => "signature_mismatch",
+            SignedHeaderError::BodyHashMismatch => "body_hash_mismatch",
+            SignedHeaderError::NonceReplay => "nonce_replay",
+            SignedHeaderError::BodyReadFailed => "body_read_failed",
+            SignedHeaderError::RedisUnavailable => "redis_unavailable",
+            SignedHeaderError::ClockUnavailable => "clock_unavailable",
+            SignedHeaderError::HmacInitialization => "hmac_initialization",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedIdentity {
+    user_id: String,
+    key_id: String,
+    nonce: String,
+    content_sha256: String,
+}
+
 #[derive(Clone)]
 struct JetRateLimitKeyExtractor {
+    key_id: Option<String>,
     shared_secret: Option<Arc<[u8]>>,
     max_skew_secs: i64,
 }
 
 impl JetRateLimitKeyExtractor {
+    fn signed_user_key_detailed<T>(
+        &self,
+        req: &Request<T>,
+    ) -> Result<VerifiedIdentity, SignedHeaderError> {
+        let key_id = self
+            .key_id
+            .as_deref()
+            .ok_or(SignedHeaderError::MissingKeyId)?;
+        let secret = self
+            .shared_secret
+            .as_ref()
+            .ok_or(SignedHeaderError::MissingSecret)?;
+        verify_v2_identity(req, key_id, secret.as_ref(), self.max_skew_secs)
+    }
+
     fn signed_user_key<T>(&self, req: &Request<T>) -> Option<String> {
-        let secret = self.shared_secret.as_ref()?;
-        let headers = req.headers();
-
-        let user_id = headers
-            .get(RATE_LIMIT_USER_HEADER)
-            .and_then(|v| v.to_str().ok())?
-            .trim();
-        if user_id.is_empty() {
-            return None;
-        }
-
-        let ts_raw = headers
-            .get(RATE_LIMIT_TIMESTAMP_HEADER)
-            .and_then(|v| v.to_str().ok())?
-            .trim();
-        let timestamp = ts_raw.parse::<i64>().ok()?;
-
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-        if (now - timestamp).abs() > self.max_skew_secs {
-            return None;
-        }
-
-        let sig_hex = headers
-            .get(RATE_LIMIT_SIGNATURE_HEADER)
-            .and_then(|v| v.to_str().ok())?
-            .trim();
-        let sig_bytes = hex::decode(sig_hex).ok()?;
-
-        let mut mac = HmacSha256::new_from_slice(secret.as_ref()).ok()?;
-        mac.update(user_id.as_bytes());
-        mac.update(b"\n");
-        mac.update(ts_raw.as_bytes());
-
-        if mac.verify_slice(&sig_bytes).is_ok() {
-            Some(user_id.to_string())
-        } else {
-            None
-        }
+        self.signed_user_key_detailed(req).ok().map(|v| v.user_id)
     }
 }
 
@@ -179,13 +254,284 @@ impl KeyExtractor for JetRateLimitKeyExtractor {
     type Key = String;
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
+        if let Some(AuthenticatedUserId(user_id)) = req.extensions().get::<AuthenticatedUserId>() {
+            return Ok(format!("user:{user_id}"));
+        }
+
         if let Some(user_id) = self.signed_user_key(req) {
             return Ok(format!("user:{user_id}"));
         }
 
+        // Protected routes should already be auth-gated. Keep a single fallback
+        // bucket for unauthenticated attempts to avoid IP fan-in surprises.
+        Ok("user:unauthenticated".to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GeneralIpKeyExtractor;
+
+impl KeyExtractor for GeneralIpKeyExtractor {
+    type Key = String;
+
+    fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
         let ip = SmartIpKeyExtractor.extract(req)?;
         Ok(format!("ip:{ip}"))
     }
+}
+
+async fn require_signed_identity(
+    State(state): State<ApiState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    let extractor = JetRateLimitKeyExtractor {
+        key_id: state.rate_limit_hmac_key_id.clone(),
+        shared_secret: state.rate_limit_hmac_secret.clone(),
+        max_skew_secs: state.rate_limit_timestamp_tolerance_secs,
+    };
+
+    let verified = match extractor.signed_user_key_detailed(&req) {
+        Ok(verified) => verified,
+        Err(reason) => {
+            warn!(reason = reason.reason_code(), "rejecting protected request: invalid signed identity headers");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                format!("invalid signed identity headers ({})", reason.reason_code()),
+            ));
+        }
+    };
+
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let body_bytes = to_bytes(body, MAX_AUTH_BODY_BYTES).await.map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "invalid signed identity headers ({})",
+                SignedHeaderError::BodyReadFailed.reason_code()
+            ),
+        )
+    })?;
+
+    if method == Method::POST || method == Method::PUT || method == Method::PATCH {
+        let actual_sha = sha256_hex(&body_bytes);
+        if actual_sha != verified.content_sha256 {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "invalid signed identity headers ({})",
+                    SignedHeaderError::BodyHashMismatch.reason_code()
+                ),
+            ));
+        }
+    }
+
+    let mut conn = state.redis_pool.get().await.map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "invalid signed identity headers ({})",
+                SignedHeaderError::RedisUnavailable.reason_code()
+            ),
+        )
+    })?;
+    let nonce_key = format!(
+        "{}:{}:{}",
+        NONCE_REPLAY_KEY_PREFIX, verified.key_id, verified.nonce
+    );
+    let inserted = conn
+        .set_nx::<_, _, bool>(&nonce_key, "1")
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "invalid signed identity headers ({})",
+                    SignedHeaderError::RedisUnavailable.reason_code()
+                ),
+            )
+        })?;
+    if !inserted {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "invalid signed identity headers ({})",
+                SignedHeaderError::NonceReplay.reason_code()
+            ),
+        ));
+    }
+    if let Err(source) = conn
+        .expire::<_, ()>(&nonce_key, state.rate_limit_nonce_ttl_secs as i64)
+        .await
+    {
+        warn!(key = %nonce_key, error = %source, "failed to set nonce expiry");
+    }
+
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.extensions_mut()
+        .insert(AuthenticatedUserId(verified.user_id));
+    Ok(next.run(req).await)
+}
+
+fn verify_v2_identity<T>(
+    req: &Request<T>,
+    expected_key_id: &str,
+    secret: &[u8],
+    max_skew_secs: i64,
+) -> Result<VerifiedIdentity, SignedHeaderError> {
+    let headers = req.headers();
+
+    let auth_version = header_value(headers, AUTH_VERSION_HEADER)
+        .ok_or(SignedHeaderError::MissingAuthVersion)?;
+    if auth_version != AUTH_VERSION_V2 {
+        return Err(SignedHeaderError::UnsupportedAuthVersion);
+    }
+
+    let key_id = header_value(headers, AUTH_KEY_ID_HEADER).ok_or(SignedHeaderError::MissingKeyId)?;
+    if key_id != expected_key_id {
+        return Err(SignedHeaderError::UnknownKeyId);
+    }
+
+    let user_id = header_value(headers, RATE_LIMIT_USER_HEADER)
+        .ok_or(SignedHeaderError::MissingUserId)?;
+    if user_id.is_empty() {
+        return Err(SignedHeaderError::EmptyUserId);
+    }
+
+    let ts_raw = header_value(headers, RATE_LIMIT_TIMESTAMP_HEADER)
+        .ok_or(SignedHeaderError::MissingTimestamp)?;
+    let timestamp = ts_raw
+        .parse::<i64>()
+        .map_err(|_| SignedHeaderError::InvalidTimestamp)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| SignedHeaderError::ClockUnavailable)?
+        .as_secs() as i64;
+    if (now - timestamp).abs() > max_skew_secs {
+        return Err(SignedHeaderError::TimestampOutOfRange);
+    }
+
+    let nonce = header_value(headers, RATE_LIMIT_NONCE_HEADER)
+        .ok_or(SignedHeaderError::MissingNonce)?;
+    if nonce.is_empty()
+        || nonce.len() > MAX_NONCE_LEN
+        || !nonce
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(SignedHeaderError::InvalidNonce);
+    }
+
+    let content_sha256 = header_value(headers, RATE_LIMIT_CONTENT_SHA256_HEADER)
+        .ok_or(SignedHeaderError::MissingContentSha256)?;
+    if content_sha256.len() != 64 || !content_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(SignedHeaderError::InvalidContentSha256);
+    }
+
+    if (req.method() == Method::POST || req.method() == Method::PUT || req.method() == Method::PATCH)
+        && canonical_content_type(headers).is_empty()
+    {
+        return Err(SignedHeaderError::MissingContentType);
+    }
+
+    let sig_hex = header_value(headers, RATE_LIMIT_SIGNATURE_HEADER)
+        .ok_or(SignedHeaderError::MissingSignature)?;
+    let sig_bytes =
+        hex::decode(sig_hex).map_err(|_| SignedHeaderError::InvalidSignatureEncoding)?;
+
+    let canonical = canonical_request_v2(
+        req.method(),
+        req.uri().path(),
+        req.uri().query(),
+        &content_sha256,
+        &canonical_content_type(headers),
+        &user_id,
+        &ts_raw,
+        &nonce,
+        &key_id,
+    );
+
+    let mut mac =
+        HmacSha256::new_from_slice(secret).map_err(|_| SignedHeaderError::HmacInitialization)?;
+    mac.update(canonical.as_bytes());
+    if mac.verify_slice(&sig_bytes).is_err() {
+        return Err(SignedHeaderError::SignatureMismatch);
+    }
+
+    Ok(VerifiedIdentity {
+        user_id,
+        key_id,
+        nonce,
+        content_sha256,
+    })
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+}
+
+fn canonical_content_type(headers: &HeaderMap) -> String {
+    let Some(raw) = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return String::new();
+    };
+
+    raw.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn canonical_query_string(raw_query: Option<&str>) -> String {
+    let Some(raw) = raw_query else {
+        return String::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = form_urlencoded::parse(raw.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    pairs
+        .into_iter()
+        .map(|(k, v)| {
+            let key = form_urlencoded::byte_serialize(k.as_bytes()).collect::<String>();
+            let value = form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>();
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn canonical_request_v2(
+    method: &Method,
+    path: &str,
+    raw_query: Option<&str>,
+    content_sha256: &str,
+    content_type: &str,
+    user_id: &str,
+    timestamp_raw: &str,
+    nonce: &str,
+    key_id: &str,
+) -> String {
+    let query = canonical_query_string(raw_query);
+    format!(
+        "{HMAC_V2_CANONICAL_PREFIX}\n{key_id}\n{timestamp_raw}\n{nonce}\n{}\n{path}\n{query}\n{content_sha256}\n{content_type}\n{user_id}",
+        method.as_str().to_ascii_uppercase(),
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(digest)
 }
 
 fn validate_job_request(req: &JobRequest) -> Result<(), (StatusCode, String)> {
@@ -277,6 +623,12 @@ pub struct StatsResponse {
     pub execute_concurrency: usize,
     pub max_queue_wait_secs: u64,
     pub host_arch: String,
+    pub strict_rate_limit_token_interval_secs: u64,
+    pub strict_rate_limit_burst: u32,
+    pub general_rate_limit_token_interval_ms: u64,
+    pub general_rate_limit_burst: u32,
+    pub poll_rate_limit_token_interval_ms: u64,
+    pub poll_rate_limit_burst: u32,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -286,13 +638,14 @@ pub fn router(state: ApiState) -> Router {
     // NOTE: GovernorConfigBuilder::per_second(n) means "replenish 1 token
     // every n seconds", NOT "n tokens per second".
     let key_extractor = JetRateLimitKeyExtractor {
+        key_id: state.rate_limit_hmac_key_id.clone(),
         shared_secret: state.rate_limit_hmac_secret.clone(),
         max_skew_secs: state.rate_limit_timestamp_tolerance_secs,
     };
 
     let strict_conf = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(3)
+        .per_second(state.strict_rate_limit_token_interval_secs)
+        .burst_size(state.strict_rate_limit_burst)
         .key_extractor(key_extractor.clone())
         .finish()
         .unwrap();
@@ -310,8 +663,15 @@ pub fn router(state: ApiState) -> Router {
     // General rate limiting: 5 requests per second, burst of 10.
     // per_millisecond(200) = 1 token every 200ms = 5 tokens/second.
     let general_conf = GovernorConfigBuilder::default()
-        .per_millisecond(200)
-        .burst_size(10)
+        .per_millisecond(state.general_rate_limit_token_interval_ms)
+        .burst_size(state.general_rate_limit_burst)
+        .key_extractor(GeneralIpKeyExtractor)
+        .finish()
+        .unwrap();
+
+    let poll_conf = GovernorConfigBuilder::default()
+        .per_millisecond(state.poll_rate_limit_token_interval_ms)
+        .burst_size(state.poll_rate_limit_burst)
         .key_extractor(key_extractor)
         .finish()
         .unwrap();
@@ -326,24 +686,45 @@ pub fn router(state: ApiState) -> Router {
         }
     });
 
+    let poll_limiter = poll_conf.limiter().clone();
+    let interval = Duration::from_secs(60);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(interval);
+            poll_limiter.retain_recent();
+        }
+    });
+
     // Define the "General" routes
     let general_routes = Router::new()
         .route("/health", get(health))
-        .route("/jobs/{id}", get(get_job))
         .route("/runtimes", get(list_runtimes))
         .route("/runtimes/{language}", get(get_language_runtimes))
         .route("/stats", get(get_stats))
         .layer(GovernorLayer::new(general_conf));
 
     // Define the "Strict" routes
-    let strict_routes = Router::new()
+    let submit_routes = Router::new()
         .route("/jobs", post(submit_job))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_identity,
+        ))
         .layer(GovernorLayer::new(strict_conf));
+
+    let poll_routes = Router::new()
+        .route("/jobs/{id}", get(get_job))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_identity,
+        ))
+        .layer(GovernorLayer::new(poll_conf));
 
     // Merge them together
     Router::new()
         .merge(general_routes)
-        .merge(strict_routes)
+        .merge(submit_routes)
+        .merge(poll_routes)
         .with_state(state)
 }
 
@@ -595,6 +976,12 @@ async fn get_stats(State(state): State<ApiState>) -> Json<StatsResponse> {
         execute_concurrency: state.execute_concurrency,
         max_queue_wait_secs: state.max_queue_wait_secs,
         host_arch: std::env::consts::ARCH.to_string(),
+        strict_rate_limit_token_interval_secs: state.strict_rate_limit_token_interval_secs,
+        strict_rate_limit_burst: state.strict_rate_limit_burst,
+        general_rate_limit_token_interval_ms: state.general_rate_limit_token_interval_ms,
+        general_rate_limit_burst: state.general_rate_limit_burst,
+        poll_rate_limit_token_interval_ms: state.poll_rate_limit_token_interval_ms,
+        poll_rate_limit_burst: state.poll_rate_limit_burst,
     })
 }
 
@@ -773,7 +1160,6 @@ async fn reconcile_enqueue_failure_state(
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
-        net::SocketAddr,
         pin::Pin,
         sync::{Arc, atomic::AtomicU64},
         time::Instant,
@@ -805,11 +1191,32 @@ mod tests {
 
     type TestHmacSha256 = Hmac<Sha256>;
 
-    fn sign_user_header(secret: &[u8], user_id: &str, timestamp: i64) -> String {
+    fn sign_user_header_v2(
+        secret: &[u8],
+        key_id: &str,
+        user_id: &str,
+        timestamp: i64,
+        nonce: &str,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        body: &[u8],
+        content_type: &str,
+    ) -> String {
+        let body_hash = super::sha256_hex(body);
+        let canonical = super::canonical_request_v2(
+            &axum::http::Method::from_bytes(method.as_bytes()).expect("valid method"),
+            path,
+            query,
+            &body_hash,
+            content_type,
+            user_id,
+            &timestamp.to_string(),
+            nonce,
+            key_id,
+        );
         let mut mac = TestHmacSha256::new_from_slice(secret).expect("valid hmac key");
-        mac.update(user_id.as_bytes());
-        mac.update(b"\n");
-        mac.update(timestamp.to_string().as_bytes());
+        mac.update(canonical.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
 
@@ -930,8 +1337,16 @@ mod tests {
             compile_concurrency: 1,
             execute_concurrency: 1,
             max_queue_wait_secs: 30,
+            rate_limit_hmac_key_id: Some("test-kid".to_string()),
             rate_limit_hmac_secret: None,
             rate_limit_timestamp_tolerance_secs: 300,
+            rate_limit_nonce_ttl_secs: 300,
+            strict_rate_limit_token_interval_secs: 1,
+            strict_rate_limit_burst: 3,
+            general_rate_limit_token_interval_ms: 200,
+            general_rate_limit_burst: 10,
+            poll_rate_limit_token_interval_ms: 50,
+            poll_rate_limit_burst: 60,
         };
 
         (state, queue, shutdown_tx)
@@ -976,6 +1391,7 @@ mod tests {
     fn extractor_prefers_valid_signed_user_id_key() {
         let secret: Arc<[u8]> = Arc::from(b"test-secret".to_vec().into_boxed_slice());
         let extractor = JetRateLimitKeyExtractor {
+            key_id: Some("kid-1".to_string()),
             shared_secret: Some(secret.clone()),
             max_skew_secs: 300,
         };
@@ -984,11 +1400,34 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("valid clock")
             .as_secs() as i64;
-        let sig = sign_user_header(secret.as_ref(), "user-123", now);
+        let nonce = "nonce-123";
+        let method = "GET";
+        let path = "/jobs/job-1";
+        let query = Some("a=2&a=1&b=%20");
+        let body = b"";
+        let content_type = "";
+        let sig = sign_user_header_v2(
+            secret.as_ref(),
+            "kid-1",
+            "user-123",
+            now,
+            nonce,
+            method,
+            path,
+            query,
+            body,
+            content_type,
+        );
 
         let req = Request::builder()
+            .method(method)
+            .uri("/jobs/job-1?b=%20&a=1&a=2")
+            .header("x-jet-auth-version", "2")
+            .header("x-jet-key-id", "kid-1")
             .header("x-jet-user-id", "user-123")
             .header("x-jet-timestamp", now.to_string())
+            .header("x-jet-nonce", nonce)
+            .header("x-jet-content-sha256", super::sha256_hex(body))
             .header("x-jet-signature", sig)
             .body(())
             .expect("request build");
@@ -998,23 +1437,30 @@ mod tests {
     }
 
     #[test]
-    fn extractor_falls_back_to_ip_when_signature_invalid() {
+    fn extractor_uses_unauthenticated_bucket_when_signature_invalid() {
         let extractor = JetRateLimitKeyExtractor {
+            key_id: Some("kid-1".to_string()),
             shared_secret: Some(Arc::from(b"test-secret".to_vec().into_boxed_slice())),
             max_skew_secs: 300,
         };
 
-        let mut req = Request::builder()
+        let req = Request::builder()
+            .method("GET")
+            .uri("/jobs/job-1")
+            .header("x-jet-auth-version", "2")
+            .header("x-jet-key-id", "kid-1")
             .header("x-jet-user-id", "user-123")
-            .header("x-jet-timestamp", "1")
+            .header("x-jet-timestamp", "9999999999")
+            .header("x-jet-nonce", "nonce-123")
+            .header("x-jet-content-sha256", super::sha256_hex(b""))
             .header("x-jet-signature", "deadbeef")
             .body(())
             .expect("request build");
-        req.extensions_mut()
-            .insert("10.2.3.4:8080".parse::<SocketAddr>().expect("socket addr"));
 
-        let key = extractor.extract(&req).expect("ip fallback should work");
-        assert_eq!(key, "ip:10.2.3.4");
+        let key = extractor
+            .extract(&req)
+            .expect("unauthenticated fallback should work");
+        assert_eq!(key, "user:unauthenticated");
     }
 
     #[tokio::test]

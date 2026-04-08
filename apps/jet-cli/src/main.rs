@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -545,6 +546,11 @@ static CROSS: Emoji<'_, '_> = Emoji("❌ ", "[ERR] ");
 static REFRESH: Emoji<'_, '_> = Emoji("🔄 ", "");
 static GAUGE: Emoji<'_, '_> = Emoji("⏱️  ", "");
 
+const REQUIRED_SERVER_ENV_KEYS: [&str; 2] = [
+    "JET_RATE_LIMIT_HMAC_KEY_ID",
+    "JET_RATE_LIMIT_HMAC_SECRET",
+];
+
 fn make_spinner() -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -869,11 +875,103 @@ fn run_updater(manager: &PackageManager, updater: &dyn jet_pack::RuntimeUpdater)
     }
 }
 
+fn parse_dotenv(contents: &str) -> Result<HashMap<String, String>> {
+    let mut vars = HashMap::new();
+
+    for (idx, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let (raw_key, raw_value) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid .env line {}: expected KEY=VALUE", idx + 1))?;
+
+        let key = raw_key.trim();
+        if key.is_empty() {
+            bail!("invalid .env line {}: empty key", idx + 1);
+        }
+
+        let mut value = raw_value.trim().to_string();
+        if value.len() >= 2 {
+            let first = value.as_bytes()[0] as char;
+            let last = value.as_bytes()[value.len() - 1] as char;
+            if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
+
+        vars.insert(key.to_string(), value);
+    }
+
+    Ok(vars)
+}
+
+fn resolve_required_server_env(dotenv_path: &Path) -> Result<Vec<(String, String)>> {
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+
+    for key in REQUIRED_SERVER_ENV_KEYS {
+        if let Ok(existing) = std::env::var(key) {
+            if !existing.trim().is_empty() {
+                resolved.push((key.to_string(), existing));
+                continue;
+            }
+        }
+        missing.push(key);
+    }
+
+    if missing.is_empty() {
+        return Ok(resolved);
+    }
+
+    let dotenv_contents = fs::read_to_string(dotenv_path).with_context(|| {
+        format!(
+            "missing required server env keys ({}) and failed to read {}",
+            missing.join(", "),
+            dotenv_path.display()
+        )
+    })?;
+    let parsed = parse_dotenv(&dotenv_contents)?;
+
+    for key in missing {
+        if let Some(value) = parsed.get(key) {
+            if !value.trim().is_empty() {
+                resolved.push((key.to_string(), value.clone()));
+            }
+        }
+    }
+
+    let unresolved: Vec<&str> = REQUIRED_SERVER_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|required| !resolved.iter().any(|(k, _)| k == required))
+        .collect();
+
+    if !unresolved.is_empty() {
+        bail!(
+            "missing required server env keys: {} (set them in shell env or {})",
+            unresolved.join(", "),
+            dotenv_path.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
 fn server_command(cmd: ServerCommand) -> Result<()> {
     match cmd.command {
         ServerSubcommands::Run { release } => {
+            let dotenv_path = PathBuf::from(".env");
+            let injected = resolve_required_server_env(&dotenv_path)?;
+
             let mut command = Command::new("cargo");
             command.args(["run", "-p", "jet-server"]);
+            for (key, value) in &injected {
+                command.env(key, value);
+            }
             if release {
                 command.arg("--release");
             }
@@ -1148,5 +1246,26 @@ mod tests {
         ];
         let p95 = percentile(&samples, 0.95).expect("p95");
         assert_eq!(p95, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn parse_dotenv_supports_plain_and_quoted_values() {
+        let parsed = parse_dotenv(
+            r#"
+            # comment
+            JET_RATE_LIMIT_HMAC_KEY_ID=key-1
+            export JET_RATE_LIMIT_HMAC_SECRET="super-secret"
+            "#,
+        )
+        .expect("dotenv should parse");
+
+        assert_eq!(
+            parsed.get("JET_RATE_LIMIT_HMAC_KEY_ID").map(String::as_str),
+            Some("key-1")
+        );
+        assert_eq!(
+            parsed.get("JET_RATE_LIMIT_HMAC_SECRET").map(String::as_str),
+            Some("super-secret")
+        );
     }
 }

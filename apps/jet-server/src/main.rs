@@ -138,17 +138,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| cpu_cores.saturating_sub(compile_concurrency).max(1));
 
+    let rate_limit_hmac_key_id = std::env::var("JET_RATE_LIMIT_HMAC_KEY_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
     let rate_limit_hmac_secret = std::env::var("JET_RATE_LIMIT_HMAC_SECRET")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(|v| Arc::<[u8]>::from(v.into_bytes()));
 
+    if rate_limit_hmac_key_id.is_none() || rate_limit_hmac_secret.is_none() {
+        return Err(
+            "JET_RATE_LIMIT_HMAC_KEY_ID and JET_RATE_LIMIT_HMAC_SECRET must both be set"
+                .into(),
+        );
+    }
+
     let rate_limit_timestamp_tolerance_secs =
         std::env::var("JET_RATE_LIMIT_TIMESTAMP_TOLERANCE_SECS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(300);
+
+    let rate_limit_nonce_ttl_secs = std::env::var("JET_RATE_LIMIT_NONCE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(rate_limit_timestamp_tolerance_secs.max(1) as u64);
+
+    let strict_rate_limit_token_interval_secs =
+        std::env::var("JET_STRICT_RATE_LIMIT_TOKEN_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+    let strict_rate_limit_burst = std::env::var("JET_STRICT_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3);
+
+    let general_rate_limit_token_interval_ms =
+        std::env::var("JET_GENERAL_RATE_LIMIT_TOKEN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50);
+    let general_rate_limit_burst = std::env::var("JET_GENERAL_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(40);
+
+    let poll_rate_limit_token_interval_ms = std::env::var("JET_POLL_RATE_LIMIT_TOKEN_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(50);
+    let poll_rate_limit_burst = std::env::var("JET_POLL_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(60);
 
     let worker_concurrency = compile_concurrency + execute_concurrency;
 
@@ -190,8 +236,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compile_concurrency,
         execute_concurrency,
         max_queue_wait_secs,
+        rate_limit_hmac_key_id,
         rate_limit_hmac_secret,
         rate_limit_timestamp_tolerance_secs,
+        rate_limit_nonce_ttl_secs,
+        strict_rate_limit_token_interval_secs,
+        strict_rate_limit_burst,
+        general_rate_limit_token_interval_ms,
+        general_rate_limit_burst,
+        poll_rate_limit_token_interval_ms,
+        poll_rate_limit_burst,
     };
 
     let worker_context = worker::runner::WorkerContext {
@@ -223,7 +277,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = api::router(api_state).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024));
+    let app = api::router(api_state.clone())
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024));
     let addr = format!("{}:{}", config.server_host, config.server_port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
@@ -235,6 +290,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execute_concurrency = execute_concurrency,
         max_queue_depth = max_queue_depth,
         max_queue_wait_secs = max_queue_wait_secs,
+        auth_kid = %api_state.rate_limit_hmac_key_id.as_deref().unwrap_or("<unset>"),
+        auth_tolerance_secs = api_state.rate_limit_timestamp_tolerance_secs,
+        auth_nonce_ttl_secs = api_state.rate_limit_nonce_ttl_secs,
+        strict_rate_interval_secs = api_state.strict_rate_limit_token_interval_secs,
+        strict_rate_burst = api_state.strict_rate_limit_burst,
+        general_rate_interval_ms = api_state.general_rate_limit_token_interval_ms,
+        general_rate_burst = api_state.general_rate_limit_burst,
+        poll_rate_interval_ms = api_state.poll_rate_limit_token_interval_ms,
+        poll_rate_burst = api_state.poll_rate_limit_burst,
         cache_key = %config.runtime_cache_key,
         "startup complete: loaded installed runtimes, version map cached"
     );

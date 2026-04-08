@@ -24,6 +24,7 @@ tower = "0.5"
 tower_governor = { version = "0.8", features = ["axum"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
 uuid = { version = "1.21.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
