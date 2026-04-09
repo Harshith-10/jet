@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{JetError, JetResult};
 
-const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
+const DEFAULT_SERVER_HOST: &str = "0.0.0.0";
 const DEFAULT_SERVER_PORT: u16 = 4000;
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const DEFAULT_RUNTIME_CACHE_KEY: &str = "jet:version_map";
