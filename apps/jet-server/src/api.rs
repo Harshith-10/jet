@@ -1331,7 +1331,7 @@ mod tests {
             jobs_failed: Arc::new(AtomicU64::new(0)),
             worker_concurrency: 1,
             jobs_in_flight: Arc::new(AtomicU64::new(0)),
-            max_queue_depth: 100,
+            max_queue_depth: 1000,
             compile_in_flight: Arc::new(AtomicU64::new(0)),
             execute_in_flight: Arc::new(AtomicU64::new(0)),
             compile_concurrency: 1,
