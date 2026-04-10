@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use jet_core::models::{ExecutionLimits, JobRequest, JobResult};
 use jet_pack::manifest::RuntimeManifest;
@@ -26,6 +27,7 @@ struct ChildEvalOutput {
 pub async fn run_supervised_job(
     payload: ChildEvalPayload,
     wall_clock_limit: std::time::Duration,
+    interrupt_requested: Arc<AtomicBool>,
 ) -> std::io::Result<JobResult> {
     let scratch_root = std::env::temp_dir().join("jet-supervisor");
     std::fs::create_dir_all(&scratch_root)?;
@@ -54,7 +56,13 @@ pub async fn run_supervised_job(
     let mut child = command.spawn()?;
     let child_pid = child.id();
 
-    let status = wait_for_supervised_exit(&mut child, child_pid, wall_clock_limit).await?;
+    let status = wait_for_supervised_exit(
+        &mut child,
+        child_pid,
+        wall_clock_limit,
+        interrupt_requested,
+    )
+    .await?;
 
     let output_raw = match std::fs::read(&output_path) {
         Ok(bytes) => bytes,
@@ -100,23 +108,40 @@ async fn wait_for_supervised_exit(
     child: &mut tokio::process::Child,
     child_pid: Option<u32>,
     wall_clock_limit: std::time::Duration,
+    interrupt_requested: Arc<AtomicBool>,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let wait_result = tokio::time::timeout(wall_clock_limit, child.wait()).await;
-    match wait_result {
-        Ok(status) => status,
-        Err(_) => {
+    let start = std::time::Instant::now();
+    loop {
+        if interrupt_requested.load(Ordering::Acquire) {
             if let Some(pid) = child_pid {
                 kill_process_tree(pid);
             }
             let _ = child.wait().await;
-            Err(std::io::Error::new(
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "job interrupted by admin request",
+            ));
+        }
+
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+
+        if start.elapsed() >= wall_clock_limit {
+            if let Some(pid) = child_pid {
+                kill_process_tree(pid);
+            }
+            let _ = child.wait().await;
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "job exceeded hard wall-clock timeout of {}s",
                     wall_clock_limit.as_secs()
                 ),
-            ))
+            ));
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -223,6 +248,7 @@ mod tests {
     use std::{
         path::Path,
         process::Stdio,
+        sync::{Arc, atomic::AtomicBool},
         time::{Duration, Instant},
     };
 
@@ -253,9 +279,14 @@ mod tests {
 
         let start = Instant::now();
         let err =
-            wait_for_supervised_exit(&mut child, Some(leader_pid), Duration::from_millis(500))
-                .await
-                .expect_err("supervised wait should time out");
+            wait_for_supervised_exit(
+                &mut child,
+                Some(leader_pid),
+                Duration::from_millis(500),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect_err("supervised wait should time out");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(5));

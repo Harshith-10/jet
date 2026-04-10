@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use apalis::prelude::*;
@@ -34,6 +34,8 @@ pub struct WorkerContext {
     /// Per-category in-flight counters for observability.
     pub compile_in_flight: Arc<AtomicU64>,
     pub execute_in_flight: Arc<AtomicU64>,
+    /// Admin-triggered interrupt flag used to preempt jobs in flight.
+    pub interrupt_requested: Arc<AtomicBool>,
     /// Maximum time (ms) a job may wait in the queue before being shed.
     pub max_queue_wait_ms: u64,
 }
@@ -64,6 +66,10 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
         .unwrap_or_default()
         .as_millis() as u64;
     let queue_wait_ms = now_ms.saturating_sub(job.enqueued_at);
+
+    if data.interrupt_requested.load(Ordering::Acquire) {
+        return record_interrupted_job(&data, &job, queue_wait_ms).await;
+    }
 
     if queue_wait_ms > data.max_queue_wait_ms {
         warn!(
@@ -110,10 +116,26 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
         ),
     };
 
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|e| std::io::Error::other(format!("semaphore closed for {category_name}: {e}")))?;
+    let _permit = loop {
+        if data.interrupt_requested.load(Ordering::Acquire) {
+            return record_interrupted_job(&data, &job, queue_wait_ms).await;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_millis(100), semaphore.acquire())
+            .await
+        {
+            Ok(Ok(permit)) => break permit,
+            Ok(Err(e)) => {
+                return Err(std::io::Error::other(format!(
+                    "semaphore closed for {category_name}: {e}"
+                )));
+            }
+            Err(_) => continue,
+        }
+    };
+    if data.interrupt_requested.load(Ordering::Acquire) {
+        return record_interrupted_job(&data, &job, queue_wait_ms).await;
+    }
     category_counter.fetch_add(1, Ordering::Relaxed);
 
     info!(
@@ -289,6 +311,7 @@ async fn process_job(
             limits,
         },
         wall_clock_limit,
+        data.interrupt_requested.clone(),
     )
     .await
     .map_err(|source| {
@@ -307,6 +330,35 @@ async fn process_job(
     cleanup_workspace(&jobs_root, &workspace_dir, &job.id).await;
 
     result
+}
+
+async fn record_interrupted_job(
+    data: &WorkerContext,
+    job: &QueuedJob,
+    queue_wait_ms: u64,
+) -> Result<(), std::io::Error> {
+    data.jobs_failed.fetch_add(1, Ordering::Relaxed);
+    saturating_decrement(&data.jobs_in_flight);
+    write_job_state(
+        &data.redis_pool,
+        &data.job_state_prefix,
+        JobStateRecord {
+            job_id: job.id.clone(),
+            status: "failed".to_string(),
+            language: job.language.clone(),
+            version: job.version.clone(),
+            result: None,
+            error: Some("job interrupted by admin request".to_string()),
+            terminal_reason: Some("interrupted_by_admin".to_string()),
+            queue_wait_ms: Some(queue_wait_ms),
+        },
+    )
+    .await?;
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "interrupted by admin request",
+    ))
 }
 
 async fn cleanup_workspace(
@@ -363,6 +415,12 @@ fn normalize_arch(arch: &str) -> &str {
 }
 
 fn classify_failure_reason(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::Interrupted
+        && error.to_string().contains("admin")
+    {
+        return "interrupted_by_admin";
+    }
+
     if error.kind() == std::io::ErrorKind::TimedOut {
         return "timeout";
     }

@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
@@ -15,9 +16,9 @@ use apalis_redis::RedisStorage;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    middleware::{self, Next},
     extract::{Path, State},
     http::{HeaderMap, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::Response,
     routing::{get, post},
 };
@@ -36,6 +37,7 @@ use tower_governor::{
 use tracing::{info, warn};
 use url::form_urlencoded;
 use uuid::Uuid;
+use tokio::sync::{Notify, RwLock};
 
 use crate::{
     counters::{saturating_decrement, try_increment_with_limit},
@@ -100,7 +102,11 @@ pub struct ApiState {
     pub jobs_failed: Arc<AtomicU64>,
     pub worker_concurrency: usize,
     pub jobs_in_flight: Arc<AtomicU64>,
-    pub max_queue_depth: u64,
+    pub max_queue_depth: Arc<RwLock<Option<u64>>>,
+    pub admin_allowed_user_ids: Arc<HashSet<String>>,
+    pub interrupt_requested: Arc<AtomicBool>,
+    pub restart_requested: Arc<AtomicBool>,
+    pub shutdown_notify: Arc<Notify>,
     /// Per-category in-flight counters for MLP stats.
     pub compile_in_flight: Arc<AtomicU64>,
     pub execute_in_flight: Arc<AtomicU64>,
@@ -146,6 +152,7 @@ const HMAC_V2_CANONICAL_PREFIX: &str = "jet-hmac-v2";
 const MAX_NONCE_LEN: usize = 128;
 const NONCE_REPLAY_KEY_PREFIX: &str = "jet:auth:nonce";
 const MAX_AUTH_BODY_BYTES: usize = 50 * 1024 * 1024;
+const ADMIN_INTERRUPT_DRAIN_MS: u64 = 250;
 
 /// TTL for job state keys set from the API side.
 const JOB_STATE_TTL_SECS: i64 = 3600; // 1 hour
@@ -181,6 +188,27 @@ enum SignedHeaderError {
     RedisUnavailable,
     ClockUnavailable,
     HmacInitialization,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueDepthRequest {
+    max_queue_depth: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueDepthResponse {
+    max_queue_depth: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InterruptRequest {
+    restart: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct InterruptResponse {
+    interrupt_requested: bool,
+    restart_requested: bool,
 }
 
 impl SignedHeaderError {
@@ -285,16 +313,10 @@ async fn require_signed_identity(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
-    let extractor = JetRateLimitKeyExtractor {
-        key_id: state.rate_limit_hmac_key_id.clone(),
-        shared_secret: state.rate_limit_hmac_secret.clone(),
-        max_skew_secs: state.rate_limit_timestamp_tolerance_secs,
-    };
-
-    let verified = match extractor.signed_user_key_detailed(&req) {
+    let verified = match verify_signed_identity_headers(&state, &req) {
         Ok(verified) => verified,
         Err(reason) => {
-            warn!(reason = reason.reason_code(), "rejecting protected request: invalid signed identity headers");
+            warn!(reason = %reason.reason_code(), "rejecting protected request: invalid signed identity headers");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 format!("invalid signed identity headers ({})", reason.reason_code()),
@@ -374,6 +396,70 @@ async fn require_signed_identity(
     Ok(next.run(req).await)
 }
 
+async fn require_admin_identity(
+    State(state): State<ApiState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    let verified = match verify_signed_identity_headers(&state, &req) {
+        Ok(verified) => verified,
+        Err(reason) => {
+            warn!(reason = %reason.reason_code(), "rejecting admin request: invalid signed identity headers");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                format!("invalid signed identity headers ({})", reason.reason_code()),
+            ));
+        }
+    };
+
+    if !state.admin_allowed_user_ids.contains(&verified.user_id) {
+        warn!(user_id = %verified.user_id, "admin access denied");
+        return Err((StatusCode::FORBIDDEN, "admin access denied".to_string()));
+    }
+
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let body_bytes = to_bytes(body, MAX_AUTH_BODY_BYTES).await.map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "invalid signed identity headers ({})",
+                SignedHeaderError::BodyReadFailed.reason_code()
+            ),
+        )
+    })?;
+
+    if method == Method::POST || method == Method::PUT || method == Method::PATCH {
+        let actual_sha = sha256_hex(&body_bytes);
+        if actual_sha != verified.content_sha256 {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "invalid signed identity headers ({})",
+                    SignedHeaderError::BodyHashMismatch.reason_code()
+                ),
+            ));
+        }
+    }
+
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.extensions_mut()
+        .insert(AuthenticatedUserId(verified.user_id));
+    Ok(next.run(req).await)
+}
+
+fn verify_signed_identity_headers(
+    state: &ApiState,
+    req: &Request<Body>,
+) -> Result<VerifiedIdentity, SignedHeaderError> {
+    let extractor = JetRateLimitKeyExtractor {
+        key_id: state.rate_limit_hmac_key_id.clone(),
+        shared_secret: state.rate_limit_hmac_secret.clone(),
+        max_skew_secs: state.rate_limit_timestamp_tolerance_secs,
+    };
+    extractor.signed_user_key_detailed(req)
+}
+
 fn verify_v2_identity<T>(
     req: &Request<T>,
     expected_key_id: &str,
@@ -382,19 +468,20 @@ fn verify_v2_identity<T>(
 ) -> Result<VerifiedIdentity, SignedHeaderError> {
     let headers = req.headers();
 
-    let auth_version = header_value(headers, AUTH_VERSION_HEADER)
-        .ok_or(SignedHeaderError::MissingAuthVersion)?;
+    let auth_version =
+        header_value(headers, AUTH_VERSION_HEADER).ok_or(SignedHeaderError::MissingAuthVersion)?;
     if auth_version != AUTH_VERSION_V2 {
         return Err(SignedHeaderError::UnsupportedAuthVersion);
     }
 
-    let key_id = header_value(headers, AUTH_KEY_ID_HEADER).ok_or(SignedHeaderError::MissingKeyId)?;
+    let key_id =
+        header_value(headers, AUTH_KEY_ID_HEADER).ok_or(SignedHeaderError::MissingKeyId)?;
     if key_id != expected_key_id {
         return Err(SignedHeaderError::UnknownKeyId);
     }
 
-    let user_id = header_value(headers, RATE_LIMIT_USER_HEADER)
-        .ok_or(SignedHeaderError::MissingUserId)?;
+    let user_id =
+        header_value(headers, RATE_LIMIT_USER_HEADER).ok_or(SignedHeaderError::MissingUserId)?;
     if user_id.is_empty() {
         return Err(SignedHeaderError::EmptyUserId);
     }
@@ -413,8 +500,8 @@ fn verify_v2_identity<T>(
         return Err(SignedHeaderError::TimestampOutOfRange);
     }
 
-    let nonce = header_value(headers, RATE_LIMIT_NONCE_HEADER)
-        .ok_or(SignedHeaderError::MissingNonce)?;
+    let nonce =
+        header_value(headers, RATE_LIMIT_NONCE_HEADER).ok_or(SignedHeaderError::MissingNonce)?;
     if nonce.is_empty()
         || nonce.len() > MAX_NONCE_LEN
         || !nonce
@@ -430,7 +517,9 @@ fn verify_v2_identity<T>(
         return Err(SignedHeaderError::InvalidContentSha256);
     }
 
-    if (req.method() == Method::POST || req.method() == Method::PUT || req.method() == Method::PATCH)
+    if (req.method() == Method::POST
+        || req.method() == Method::PUT
+        || req.method() == Method::PATCH)
         && canonical_content_type(headers).is_empty()
     {
         return Err(SignedHeaderError::MissingContentType);
@@ -615,7 +704,7 @@ pub struct StatsResponse {
     pub jobs_in_flight: u64,
     pub compile_in_flight: u64,
     pub execute_in_flight: u64,
-    pub max_queue_depth: u64,
+    pub max_queue_depth: Option<u64>,
     pub installed_runtimes: usize,
     pub supported_languages: Vec<String>,
     pub worker_concurrency: usize,
@@ -644,6 +733,13 @@ pub fn router(state: ApiState) -> Router {
     };
 
     let strict_conf = GovernorConfigBuilder::default()
+        .per_second(state.strict_rate_limit_token_interval_secs)
+        .burst_size(state.strict_rate_limit_burst)
+        .key_extractor(key_extractor.clone())
+        .finish()
+        .unwrap();
+
+    let admin_conf = GovernorConfigBuilder::default()
         .per_second(state.strict_rate_limit_token_interval_secs)
         .burst_size(state.strict_rate_limit_burst)
         .key_extractor(key_extractor.clone())
@@ -720,11 +816,21 @@ pub fn router(state: ApiState) -> Router {
         ))
         .layer(GovernorLayer::new(poll_conf));
 
+    let admin_routes = Router::new()
+        .route("/admin/queue-depth", get(get_queue_depth).put(set_queue_depth).delete(unset_queue_depth))
+        .route("/admin/interrupt", post(interrupt_all))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_identity,
+        ))
+        .layer(GovernorLayer::new(admin_conf));
+
     // Merge them together
     Router::new()
         .merge(general_routes)
         .merge(submit_routes)
         .merge(poll_routes)
+        .merge(admin_routes)
         .with_state(state)
 }
 
@@ -737,6 +843,13 @@ async fn submit_job(
     headers: HeaderMap,
     Json(mut request): Json<JobRequest>,
 ) -> Result<(StatusCode, Json<SubmitJobResponse>), (StatusCode, String)> {
+    if state.interrupt_requested.load(Ordering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "job submission paused while the server is handling an admin interrupt".to_string(),
+        ));
+    }
+
     validate_job_request(&request).map_err(|e| {
         warn!(language = %request.language, reason = %e.1, "job submission rejected: validation");
         e
@@ -796,20 +909,28 @@ async fn submit_job(
         crate::queue::JobType::Execute
     };
 
-    if !try_increment_with_limit(&state.jobs_in_flight, state.max_queue_depth) {
-        let in_flight = state.jobs_in_flight.load(Ordering::Relaxed);
-        warn!(
-            in_flight = in_flight,
-            max = state.max_queue_depth,
-            "rejecting job: queue full"
-        );
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "server is overloaded: {} jobs in flight (max: {})",
-                in_flight, state.max_queue_depth
-            ),
-        ));
+    let queue_depth_limit = *state.max_queue_depth.read().await;
+    match queue_depth_limit {
+        Some(limit) => {
+            if !try_increment_with_limit(&state.jobs_in_flight, limit) {
+                let in_flight = state.jobs_in_flight.load(Ordering::Relaxed);
+                warn!(
+                    in_flight = in_flight,
+                    max = limit,
+                    "rejecting job: queue full"
+                );
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "server is overloaded: {} jobs in flight (max: {})",
+                        in_flight, limit
+                    ),
+                ));
+            }
+        }
+        None => {
+            state.jobs_in_flight.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let client_job_id = request.job_id.take();
@@ -960,6 +1081,8 @@ async fn get_stats(State(state): State<ApiState>) -> Json<StatsResponse> {
         .collect();
     langs.sort();
 
+    let max_queue_depth = *state.max_queue_depth.read().await;
+
     Json(StatsResponse {
         uptime_seconds: uptime.as_secs(),
         jobs_submitted: state.jobs_submitted.load(Ordering::Relaxed),
@@ -968,7 +1091,7 @@ async fn get_stats(State(state): State<ApiState>) -> Json<StatsResponse> {
         jobs_in_flight: state.jobs_in_flight.load(Ordering::Relaxed),
         compile_in_flight: state.compile_in_flight.load(Ordering::Relaxed),
         execute_in_flight: state.execute_in_flight.load(Ordering::Relaxed),
-        max_queue_depth: state.max_queue_depth,
+        max_queue_depth,
         installed_runtimes: state.manifests.len(),
         supported_languages: langs,
         worker_concurrency: state.worker_concurrency,
@@ -982,6 +1105,65 @@ async fn get_stats(State(state): State<ApiState>) -> Json<StatsResponse> {
         general_rate_limit_burst: state.general_rate_limit_burst,
         poll_rate_limit_token_interval_ms: state.poll_rate_limit_token_interval_ms,
         poll_rate_limit_burst: state.poll_rate_limit_burst,
+    })
+}
+
+async fn get_queue_depth(State(state): State<ApiState>) -> Json<QueueDepthResponse> {
+    Json(QueueDepthResponse {
+        max_queue_depth: *state.max_queue_depth.read().await,
+    })
+}
+
+async fn set_queue_depth(
+    State(state): State<ApiState>,
+    Json(request): Json<QueueDepthRequest>,
+) -> Json<QueueDepthResponse> {
+    *state.max_queue_depth.write().await = Some(request.max_queue_depth);
+    Json(QueueDepthResponse {
+        max_queue_depth: Some(request.max_queue_depth),
+    })
+}
+
+async fn unset_queue_depth(State(state): State<ApiState>) -> Json<QueueDepthResponse> {
+    *state.max_queue_depth.write().await = None;
+    Json(QueueDepthResponse {
+        max_queue_depth: None,
+    })
+}
+
+async fn interrupt_all(
+    State(state): State<ApiState>,
+    Json(request): Json<InterruptRequest>,
+) -> Json<InterruptResponse> {
+    state.interrupt_requested.store(true, Ordering::Release);
+    state.restart_requested.store(request.restart, Ordering::Release);
+
+    if request.restart {
+        let shutdown_notify = state.shutdown_notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ADMIN_INTERRUPT_DRAIN_MS)).await;
+            shutdown_notify.notify_waiters();
+        });
+    } else if state.jobs_in_flight.load(Ordering::Acquire) == 0 {
+        // Empty queue interrupt should be a no-op for subsequent submissions.
+        state.interrupt_requested.store(false, Ordering::Release);
+    } else {
+        let interrupt_requested = state.interrupt_requested.clone();
+        let jobs_in_flight = state.jobs_in_flight.clone();
+        tokio::spawn(async move {
+            loop {
+                if jobs_in_flight.load(Ordering::Acquire) == 0 {
+                    interrupt_requested.store(false, Ordering::Release);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    Json(InterruptResponse {
+        interrupt_requested: state.interrupt_requested.load(Ordering::Acquire),
+        restart_requested: request.restart,
     })
 }
 
@@ -1161,7 +1343,8 @@ mod tests {
     use std::{
         collections::{HashMap, VecDeque},
         pin::Pin,
-        sync::{Arc, atomic::AtomicU64},
+        sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
+        time::Duration,
         time::Instant,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1179,12 +1362,14 @@ mod tests {
     use sha2::Sha256;
     use tokio::{
         net::TcpListener,
-        sync::{Mutex, oneshot},
+        sync::{Mutex, Notify, RwLock, oneshot},
     };
     use tower_governor::key_extractor::KeyExtractor;
 
     use super::{
-        ApiState, IDEMPOTENCY_HEADER, JetRateLimitKeyExtractor, JobQueue, get_job, submit_job,
+        ApiState, IDEMPOTENCY_HEADER, InterruptRequest, JetRateLimitKeyExtractor, JobQueue,
+        QueueDepthRequest, get_job, get_queue_depth, interrupt_all, set_queue_depth,
+        submit_job, unset_queue_depth,
     };
     use crate::queue::{JobStateRecord, QueuedJob, job_state_key};
     use jet_pack::{VersionResolver, manifest::RuntimeManifest};
@@ -1331,7 +1516,13 @@ mod tests {
             jobs_failed: Arc::new(AtomicU64::new(0)),
             worker_concurrency: 1,
             jobs_in_flight: Arc::new(AtomicU64::new(0)),
-            max_queue_depth: 1000,
+            max_queue_depth: Arc::new(RwLock::new(Some(1000))),
+            admin_allowed_user_ids: Arc::new(std::collections::HashSet::from([
+                "test-admin".to_string(),
+            ])),
+            interrupt_requested: Arc::new(AtomicBool::new(false)),
+            restart_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
             compile_in_flight: Arc::new(AtomicU64::new(0)),
             execute_in_flight: Arc::new(AtomicU64::new(0)),
             compile_concurrency: 1,
@@ -1518,6 +1709,112 @@ mod tests {
             .await
             .expect("state lookup");
         assert!(queued_raw.is_some());
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn submit_job_allows_unlimited_queue_depth() {
+        let (state, queue, shutdown_tx) = setup_state().await;
+        *state.max_queue_depth.write().await = None;
+        state.jobs_in_flight.store(500, Ordering::Relaxed);
+
+        let request = JobRequest {
+            job_id: None,
+            language: "python".to_string(),
+            version: Some("3.14".to_string()),
+            files: vec![FileRequest {
+                name: Some("main.py".to_string()),
+                content: "print(1)".to_string(),
+                encoding: None,
+            }],
+            testcases: None,
+            args: None,
+            stdin: None,
+            run_timeout: None,
+            compile_timeout: None,
+            run_memory_limit: None,
+            compile_memory_limit: None,
+            run_output_limit: None,
+            compile_output_limit: None,
+        };
+
+        let (status, _) = submit_job(State(state.clone()), HeaderMap::new(), axum::Json(request))
+            .await
+            .expect("submit should succeed with unlimited queue depth");
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(queue.len().await, 1);
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn queue_depth_admin_handlers_round_trip() {
+        let (state, _, shutdown_tx) = setup_state().await;
+
+        let response = get_queue_depth(State(state.clone())).await;
+        assert_eq!(response.0.max_queue_depth, Some(1000));
+
+        let response = set_queue_depth(
+            State(state.clone()),
+            axum::Json(QueueDepthRequest { max_queue_depth: 42 }),
+        )
+        .await;
+        assert_eq!(response.0.max_queue_depth, Some(42));
+
+        let response = unset_queue_depth(State(state.clone())).await;
+        assert_eq!(response.0.max_queue_depth, None);
+
+        let response = interrupt_all(
+            State(state.clone()),
+            axum::Json(InterruptRequest { restart: true }),
+        )
+        .await;
+        assert!(response.0.interrupt_requested);
+        assert!(response.0.restart_requested);
+        assert!(state.interrupt_requested.load(Ordering::Relaxed));
+        assert!(state.restart_requested.load(Ordering::Relaxed));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn interrupt_without_restart_clears_immediately_when_idle() {
+        let (state, _, shutdown_tx) = setup_state().await;
+        state.jobs_in_flight.store(0, Ordering::Relaxed);
+
+        let response = interrupt_all(
+            State(state.clone()),
+            axum::Json(InterruptRequest { restart: false }),
+        )
+        .await;
+
+        assert!(!response.0.interrupt_requested);
+        assert!(!response.0.restart_requested);
+        assert!(!state.interrupt_requested.load(Ordering::Relaxed));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn interrupt_without_restart_clears_after_jobs_drain() {
+        let (state, _, shutdown_tx) = setup_state().await;
+        state.jobs_in_flight.store(1, Ordering::Relaxed);
+
+        let response = interrupt_all(
+            State(state.clone()),
+            axum::Json(InterruptRequest { restart: false }),
+        )
+        .await;
+
+        assert!(response.0.interrupt_requested);
+        assert!(state.interrupt_requested.load(Ordering::Relaxed));
+
+        state.jobs_in_flight.store(0, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(!state.interrupt_requested.load(Ordering::Relaxed));
 
         let _ = shutdown_tx.send(());
     }

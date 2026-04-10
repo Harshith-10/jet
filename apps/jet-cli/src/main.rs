@@ -546,10 +546,8 @@ static CROSS: Emoji<'_, '_> = Emoji("❌ ", "[ERR] ");
 static REFRESH: Emoji<'_, '_> = Emoji("🔄 ", "");
 static GAUGE: Emoji<'_, '_> = Emoji("⏱️  ", "");
 
-const REQUIRED_SERVER_ENV_KEYS: [&str; 2] = [
-    "JET_RATE_LIMIT_HMAC_KEY_ID",
-    "JET_RATE_LIMIT_HMAC_SECRET",
-];
+const REQUIRED_SERVER_ENV_KEYS: [&str; 3] =
+    ["JET_RATE_LIMIT_HMAC_KEY_ID", "JET_RATE_LIMIT_HMAC_SECRET", "JET_ADMIN_ALLOWED_USER_IDS"];
 
 fn make_spinner() -> ProgressBar {
     let pb = ProgressBar::new_spinner();

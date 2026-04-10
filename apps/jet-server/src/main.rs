@@ -1,5 +1,9 @@
 use std::{
-    collections::HashMap, net::SocketAddr, path::Path, sync::Arc, sync::atomic::AtomicU64,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Instant,
 };
 
@@ -8,6 +12,7 @@ use deadpool_redis::{Config as PoolConfig, Runtime as PoolRuntime, redis::AsyncC
 use jet_core::JetConfig;
 use jet_pack::{RedisVersionStore, VersionResolver};
 use tokio::sync::Semaphore;
+use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 
 mod api;
@@ -151,8 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if rate_limit_hmac_key_id.is_none() || rate_limit_hmac_secret.is_none() {
         return Err(
-            "JET_RATE_LIMIT_HMAC_KEY_ID and JET_RATE_LIMIT_HMAC_SECRET must both be set"
-                .into(),
+            "JET_RATE_LIMIT_HMAC_KEY_ID and JET_RATE_LIMIT_HMAC_SECRET must both be set".into(),
         );
     }
 
@@ -196,6 +200,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(60);
 
+    let admin_allowed_user_ids = std::env::var("JET_ADMIN_ALLOWED_USER_IDS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    if admin_allowed_user_ids.is_empty() {
+        return Err("JET_ADMIN_ALLOWED_USER_IDS must contain at least one user id".into());
+    }
+
     let worker_concurrency = compile_concurrency + execute_concurrency;
 
     // Maximum queue depth before rejecting new submissions (backpressure).
@@ -217,6 +235,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-category in-flight counters.
     let compile_in_flight = Arc::new(AtomicU64::new(0));
     let execute_in_flight = Arc::new(AtomicU64::new(0));
+    let interrupt_requested = Arc::new(AtomicBool::new(false));
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
 
     let api_state = api::ApiState {
         resolver: Arc::new(resolver),
@@ -230,7 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jobs_failed: jobs_failed.clone(),
         worker_concurrency,
         jobs_in_flight: jobs_in_flight.clone(),
-        max_queue_depth,
+        max_queue_depth: Arc::new(RwLock::new(Some(max_queue_depth))),
+        admin_allowed_user_ids: Arc::new(admin_allowed_user_ids),
+        interrupt_requested: interrupt_requested.clone(),
+        restart_requested: restart_requested.clone(),
+        shutdown_notify: shutdown_notify.clone(),
         compile_in_flight: compile_in_flight.clone(),
         execute_in_flight: execute_in_flight.clone(),
         compile_concurrency,
@@ -260,6 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execute_semaphore,
         compile_in_flight,
         execute_in_flight,
+        interrupt_requested,
         max_queue_wait_ms: max_queue_wait_secs * 1000,
     };
 
@@ -310,11 +336,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(shutdown_notify.clone()))
     .await?;
 
     // After the HTTP server shuts down, stop the worker.
     info!("stopping worker...");
+    if api_state.restart_requested.load(Ordering::Acquire)
+        || api_state.interrupt_requested.load(Ordering::Acquire)
+    {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        while api_state.jobs_in_flight.load(Ordering::Acquire) > 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
     worker_handle.abort();
     match worker_handle.await {
         Ok(_) => info!("worker stopped cleanly"),
@@ -392,7 +428,7 @@ async fn cleanup_stale_workspaces(jobs_dir: &Path) {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown_notify: Arc<Notify>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -416,6 +452,9 @@ async fn shutdown_signal() {
         },
         _ = terminate => {
             info!("signal received: terminate");
+        },
+        _ = shutdown_notify.notified() => {
+            info!("signal received: admin shutdown request");
         },
     }
 
