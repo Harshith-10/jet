@@ -15,6 +15,10 @@ jet-pack = { path = "../../crates/jet-pack" }
 reqwest = { version = "0.12.28", features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+hmac = "0.12.1"
+sha2 = "0.10.9"
+hex = "0.4.3"
+url = "2.5.7"
 tokio = { version = "1.49.0", features = [
     "rt-multi-thread",
     "macros",

@@ -7,19 +7,26 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use console::{Emoji, Style, style};
 use futures::future::join_all;
+use hmac::{Hmac, Mac};
 use indicatif::{ProgressBar, ProgressStyle};
 use jet_core::{FileRequest, JetConfig, JobRequest, JobResult};
 use jet_pack::{PackageManager, get_updaters};
 use reqwest::StatusCode;
+use reqwest::{
+    Method,
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use url::form_urlencoded;
 
 #[derive(Parser, Debug)]
 #[command(name = "jet-cli", version, about = "Jet CLI")]
@@ -203,6 +210,12 @@ enum ServerSubcommands {
         #[arg(long = "release", default_value_t = false)]
         release: bool,
     },
+    QueueDepth {
+        #[arg(long = "server", default_value = "http://127.0.0.1:4000")]
+        server: String,
+        #[arg(long = "set", value_name = "N|unlimited")]
+        set: Option<String>,
+    },
     GenerateSystemd {
         #[arg(long = "output", default_value = "jet-server.service")]
         output: PathBuf,
@@ -233,6 +246,25 @@ struct JobStateRecord {
     result: Option<JobResult>,
     error: Option<String>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct QueueDepthResponse {
+    max_queue_depth: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QueueDepthRequest {
+    max_queue_depth: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AdminAuthMaterial {
+    key_id: String,
+    secret: String,
+    user_id: String,
+}
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Detect the host CPU architecture and normalise it to the key used in
 /// runtime manifests (`"x86_64"` or `"aarch64"`).
@@ -546,8 +578,13 @@ static CROSS: Emoji<'_, '_> = Emoji("❌ ", "[ERR] ");
 static REFRESH: Emoji<'_, '_> = Emoji("🔄 ", "");
 static GAUGE: Emoji<'_, '_> = Emoji("⏱️  ", "");
 
-const REQUIRED_SERVER_ENV_KEYS: [&str; 3] =
-    ["JET_RATE_LIMIT_HMAC_KEY_ID", "JET_RATE_LIMIT_HMAC_SECRET", "JET_ADMIN_ALLOWED_USER_IDS"];
+const REQUIRED_SERVER_ENV_KEYS: [&str; 3] = [
+    "JET_RATE_LIMIT_HMAC_KEY_ID",
+    "JET_RATE_LIMIT_HMAC_SECRET",
+    "JET_ADMIN_ALLOWED_USER_IDS",
+];
+const AUTH_VERSION_V2: &str = "2";
+const HMAC_V2_CANONICAL_PREFIX: &str = "jet-hmac-v2";
 
 fn make_spinner() -> ProgressBar {
     let pb = ProgressBar::new_spinner();
@@ -959,11 +996,354 @@ fn resolve_required_server_env(dotenv_path: &Path) -> Result<Vec<(String, String
     Ok(resolved)
 }
 
+fn resolve_dotenv_map(dotenv_path: &Path) -> Result<HashMap<String, String>> {
+    match fs::read_to_string(dotenv_path) {
+        Ok(contents) => parse_dotenv(&contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", dotenv_path.display())),
+    }
+}
+
+fn append_dotenv_entries(dotenv_path: &Path, entries: &[(String, String)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut append = String::new();
+    if dotenv_path.exists() {
+        let current = fs::read_to_string(dotenv_path)
+            .with_context(|| format!("failed to read {}", dotenv_path.display()))?;
+        if !current.ends_with('\n') {
+            append.push('\n');
+        }
+    }
+
+    for (key, value) in entries {
+        append.push_str(&format!("{key}={value}\n"));
+    }
+
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dotenv_path)
+        .with_context(|| format!("failed to open {}", dotenv_path.display()))?;
+    file.write_all(append.as_bytes())
+        .with_context(|| format!("failed to write {}", dotenv_path.display()))?;
+    Ok(())
+}
+
+fn generate_secure_token(label: &str, byte_len: usize) -> Result<String> {
+    let output = Command::new("openssl")
+        .args(["rand", "-hex", &byte_len.to_string()])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let fallback = format!("{label}:{}:{}", std::process::id(), now);
+    Ok(hex::encode(Sha256::digest(fallback.as_bytes())))
+}
+
+fn ensure_server_auth_env(dotenv_path: &Path) -> Result<Vec<(String, String)>> {
+    let mut parsed = resolve_dotenv_map(dotenv_path)?;
+    let mut generated: Vec<(String, String)> = Vec::new();
+
+    let mut resolved = Vec::new();
+    for key in REQUIRED_SERVER_ENV_KEYS {
+        if let Ok(existing) = std::env::var(key) {
+            if !existing.trim().is_empty() {
+                resolved.push((key.to_string(), existing));
+                continue;
+            }
+        }
+
+        if let Some(value) = parsed.get(key).filter(|v| !v.trim().is_empty()) {
+            resolved.push((key.to_string(), value.clone()));
+            continue;
+        }
+
+        let generated_value = match key {
+            "JET_RATE_LIMIT_HMAC_KEY_ID" => format!("kid-{}", generate_secure_token("kid", 8)?),
+            "JET_RATE_LIMIT_HMAC_SECRET" => generate_secure_token("secret", 32)?,
+            "JET_ADMIN_ALLOWED_USER_IDS" => {
+                format!("admin-{}", generate_secure_token("admin", 12)?)
+            }
+            _ => continue,
+        };
+
+        parsed.insert(key.to_string(), generated_value.clone());
+        generated.push((key.to_string(), generated_value.clone()));
+        resolved.push((key.to_string(), generated_value));
+    }
+
+    append_dotenv_entries(dotenv_path, &generated)?;
+
+    if !generated.is_empty() {
+        println!(
+            "{}Generated missing server auth keys in {}",
+            CHECKMARK,
+            dotenv_path.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
+fn first_admin_user_id(raw: &str) -> Option<String> {
+    raw.split(',')
+        .map(|entry| entry.trim())
+        .find(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_admin_auth_material(dotenv_path: &Path) -> Result<AdminAuthMaterial> {
+    let env = resolve_required_server_env(dotenv_path)?;
+    let as_map: HashMap<String, String> = env.into_iter().collect();
+
+    let key_id = as_map
+        .get("JET_RATE_LIMIT_HMAC_KEY_ID")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing JET_RATE_LIMIT_HMAC_KEY_ID"))?;
+    let secret = as_map
+        .get("JET_RATE_LIMIT_HMAC_SECRET")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing JET_RATE_LIMIT_HMAC_SECRET"))?;
+    let user_ids = as_map
+        .get("JET_ADMIN_ALLOWED_USER_IDS")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing JET_ADMIN_ALLOWED_USER_IDS"))?;
+    let user_id = first_admin_user_id(&user_ids)
+        .ok_or_else(|| anyhow!("JET_ADMIN_ALLOWED_USER_IDS must contain at least one value"))?;
+
+    Ok(AdminAuthMaterial {
+        key_id,
+        secret,
+        user_id,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn canonical_query_string(raw_query: Option<&str>) -> String {
+    let Some(raw) = raw_query else {
+        return String::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = form_urlencoded::parse(raw.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    pairs
+        .into_iter()
+        .map(|(k, v)| {
+            let key = form_urlencoded::byte_serialize(k.as_bytes()).collect::<String>();
+            let value = form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>();
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn canonical_request_v2(
+    method: &Method,
+    path: &str,
+    raw_query: Option<&str>,
+    content_sha256: &str,
+    content_type: &str,
+    user_id: &str,
+    timestamp_raw: &str,
+    nonce: &str,
+    key_id: &str,
+) -> String {
+    let query = canonical_query_string(raw_query);
+    format!(
+        "{HMAC_V2_CANONICAL_PREFIX}\n{key_id}\n{timestamp_raw}\n{nonce}\n{}\n{path}\n{query}\n{content_sha256}\n{content_type}\n{user_id}",
+        method.as_str().to_ascii_uppercase(),
+    )
+}
+
+fn build_signed_headers(
+    auth: &AdminAuthMaterial,
+    method: &Method,
+    url: &str,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<HeaderMap> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow!("system clock is before unix epoch"))?
+        .as_secs() as i64;
+    let timestamp_raw = timestamp.to_string();
+    let nonce = generate_secure_token("nonce", 16)?;
+    let content_sha256 = sha256_hex(body);
+
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
+    let canonical = canonical_request_v2(
+        method,
+        parsed.path(),
+        parsed.query(),
+        &content_sha256,
+        content_type.unwrap_or(""),
+        &auth.user_id,
+        &timestamp_raw,
+        &nonce,
+        &auth.key_id,
+    );
+
+    let mut mac = HmacSha256::new_from_slice(auth.secret.as_bytes())
+        .map_err(|_| anyhow!("invalid HMAC secret"))?;
+    mac.update(canonical.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-jet-auth-version"),
+        HeaderValue::from_static(AUTH_VERSION_V2),
+    );
+    headers.insert(
+        HeaderName::from_static("x-jet-key-id"),
+        HeaderValue::from_str(&auth.key_id)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-jet-user-id"),
+        HeaderValue::from_str(&auth.user_id)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-jet-timestamp"),
+        HeaderValue::from_str(&timestamp_raw)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-jet-nonce"),
+        HeaderValue::from_str(&nonce)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-jet-content-sha256"),
+        HeaderValue::from_str(&content_sha256)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-jet-signature"),
+        HeaderValue::from_str(&signature)?,
+    );
+
+    if let Some(ct) = content_type {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_str(ct)?);
+    }
+
+    Ok(headers)
+}
+
+fn parse_queue_depth_set(value: &str) -> Result<Option<u64>> {
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(None);
+    }
+
+    value.parse::<u64>().map(Some).with_context(|| {
+        format!("invalid queue depth '{value}': expected non-negative integer or 'unlimited'")
+    })
+}
+
+async fn queue_depth_get(
+    client: &reqwest::Client,
+    server: &str,
+    auth: &AdminAuthMaterial,
+) -> Result<QueueDepthResponse> {
+    let url = format!("{}/admin/queue-depth", server.trim_end_matches('/'));
+    let headers = build_signed_headers(auth, &Method::GET, &url, b"", None)?;
+    let response = client
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await
+        .context("failed to request queue depth")?;
+
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        bail!("queue depth read failed ({status}): {body}");
+    }
+
+    response
+        .json::<QueueDepthResponse>()
+        .await
+        .context("failed to parse queue depth response")
+}
+
+async fn queue_depth_set(
+    client: &reqwest::Client,
+    server: &str,
+    auth: &AdminAuthMaterial,
+    max_queue_depth: Option<u64>,
+) -> Result<QueueDepthResponse> {
+    let url = format!("{}/admin/queue-depth", server.trim_end_matches('/'));
+
+    let response = if let Some(limit) = max_queue_depth {
+        let payload = serde_json::to_vec(&QueueDepthRequest {
+            max_queue_depth: limit,
+        })
+        .context("failed to encode queue depth payload")?;
+        let headers =
+            build_signed_headers(auth, &Method::PUT, &url, &payload, Some("application/json"))?;
+        client
+            .put(&url)
+            .headers(headers)
+            .body(payload)
+            .send()
+            .await
+            .context("failed to update queue depth")?
+    } else {
+        let headers = build_signed_headers(auth, &Method::DELETE, &url, b"", None)?;
+        client
+            .delete(&url)
+            .headers(headers)
+            .send()
+            .await
+            .context("failed to clear queue depth")?
+    };
+
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        bail!("queue depth update failed ({status}): {body}");
+    }
+
+    response
+        .json::<QueueDepthResponse>()
+        .await
+        .context("failed to parse queue depth response")
+}
+
+fn print_queue_depth(prefix: &str, value: Option<u64>) {
+    match value {
+        Some(limit) => println!("{prefix}: {limit}"),
+        None => println!("{prefix}: unlimited"),
+    }
+}
+
 fn server_command(cmd: ServerCommand) -> Result<()> {
     match cmd.command {
         ServerSubcommands::Run { release } => {
             let dotenv_path = PathBuf::from(".env");
-            let injected = resolve_required_server_env(&dotenv_path)?;
+            let injected = ensure_server_auth_env(&dotenv_path)?;
 
             let mut command = Command::new("cargo");
             command.args(["run", "-p", "jet-server"]);
@@ -978,6 +1358,28 @@ fn server_command(cmd: ServerCommand) -> Result<()> {
             if !status.success() {
                 bail!("jet-server exited with non-zero status");
             }
+            Ok(())
+        }
+        ServerSubcommands::QueueDepth { server, set } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to initialize async runtime")?;
+            rt.block_on(async move {
+                let auth = resolve_admin_auth_material(Path::new(".env"))?;
+                let client = reqwest::Client::new();
+
+                if let Some(value) = set {
+                    let target = parse_queue_depth_set(&value)?;
+                    let updated = queue_depth_set(&client, &server, &auth, target).await?;
+                    print_queue_depth("updated max queue depth", updated.max_queue_depth);
+                } else {
+                    let current = queue_depth_get(&client, &server, &auth).await?;
+                    print_queue_depth("current max queue depth", current.max_queue_depth);
+                }
+
+                Ok::<(), anyhow::Error>(())
+            })?;
             Ok(())
         }
         ServerSubcommands::GenerateSystemd { output, user } => {
@@ -1265,5 +1667,27 @@ mod tests {
             parsed.get("JET_RATE_LIMIT_HMAC_SECRET").map(String::as_str),
             Some("super-secret")
         );
+    }
+
+    #[test]
+    fn parse_queue_depth_set_supports_unlimited_and_numbers() {
+        assert_eq!(
+            parse_queue_depth_set("unlimited").expect("parses unlimited"),
+            None
+        );
+        assert_eq!(
+            parse_queue_depth_set("42").expect("parses number"),
+            Some(42)
+        );
+        assert!(parse_queue_depth_set("oops").is_err());
+    }
+
+    #[test]
+    fn first_admin_user_id_extracts_first_non_empty_entry() {
+        assert_eq!(
+            first_admin_user_id(" , admin-1,admin-2 ").as_deref(),
+            Some("admin-1")
+        );
+        assert!(first_admin_user_id(" , ").is_none());
     }
 }
