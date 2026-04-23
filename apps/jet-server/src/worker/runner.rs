@@ -81,7 +81,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
         );
         data.jobs_failed.fetch_add(1, Ordering::Relaxed);
         saturating_decrement(&data.jobs_in_flight);
-        write_job_state(
+        persist_job_state_best_effort(
             &data.redis_pool,
             &data.job_state_prefix,
             JobStateRecord {
@@ -97,8 +97,9 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                 terminal_reason: Some("queue_timeout".to_string()),
                 queue_wait_ms: Some(queue_wait_ms),
             },
+            "queue-time shedding",
         )
-        .await?;
+        .await;
         return Ok(());
     }
 
@@ -126,9 +127,33 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
         {
             Ok(Ok(permit)) => break permit,
             Ok(Err(e)) => {
-                return Err(std::io::Error::other(format!(
-                    "semaphore closed for {category_name}: {e}"
-                )));
+                let error_message = format!("semaphore closed for {category_name}: {e}");
+                error!(
+                    job_id = %job.id,
+                    language = %job.language,
+                    job_type = category_name,
+                    error = %error_message,
+                    "failed to acquire worker semaphore; finalizing job as failed"
+                );
+                data.jobs_failed.fetch_add(1, Ordering::Relaxed);
+                saturating_decrement(&data.jobs_in_flight);
+                persist_job_state_best_effort(
+                    &data.redis_pool,
+                    &data.job_state_prefix,
+                    JobStateRecord {
+                        job_id: job.id.clone(),
+                        status: "failed".to_string(),
+                        language: job.language.clone(),
+                        version: job.version.clone(),
+                        result: None,
+                        error: Some(error_message),
+                        terminal_reason: Some("execution_error".to_string()),
+                        queue_wait_ms: Some(queue_wait_ms),
+                    },
+                    "semaphore acquisition",
+                )
+                .await;
+                return Ok(());
             }
             Err(_) => continue,
         }
@@ -147,7 +172,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
         "job starting"
     );
 
-    write_job_state(
+    if let Err(source) = write_job_state(
         &data.redis_pool,
         &data.job_state_prefix,
         JobStateRecord {
@@ -161,7 +186,36 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             queue_wait_ms: Some(queue_wait_ms),
         },
     )
-    .await?;
+    .await
+    {
+        error!(
+            job_id = %job.id,
+            language = %job.language,
+            job_type = category_name,
+            error = %source,
+            "failed to persist running state; finalizing job as failed"
+        );
+        data.jobs_failed.fetch_add(1, Ordering::Relaxed);
+        saturating_decrement(&category_counter);
+        saturating_decrement(&data.jobs_in_flight);
+        persist_job_state_best_effort(
+            &data.redis_pool,
+            &data.job_state_prefix,
+            JobStateRecord {
+                job_id: job.id.clone(),
+                status: "failed".to_string(),
+                language: job.language.clone(),
+                version: job.version.clone(),
+                result: None,
+                error: Some(format!("failed to persist running state: {source}")),
+                terminal_reason: Some("execution_error".to_string()),
+                queue_wait_ms: Some(queue_wait_ms),
+            },
+            "running-state write",
+        )
+        .await;
+        return Ok(());
+    }
 
     let start = std::time::Instant::now();
     let result = process_job(&job, &data).await;
@@ -181,7 +235,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             );
             data.jobs_completed.fetch_add(1, Ordering::Relaxed);
             saturating_decrement(&data.jobs_in_flight);
-            write_job_state(
+            persist_job_state_best_effort(
                 &data.redis_pool,
                 &data.job_state_prefix,
                 JobStateRecord {
@@ -194,8 +248,9 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     terminal_reason: Some(terminal_reason_from_result(&job_result).to_string()),
                     queue_wait_ms: Some(queue_wait_ms),
                 },
+                "job completion",
             )
-            .await?;
+            .await;
         }
         Err(source) => {
             error!(
@@ -208,7 +263,7 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
             );
             data.jobs_failed.fetch_add(1, Ordering::Relaxed);
             saturating_decrement(&data.jobs_in_flight);
-            write_job_state(
+            persist_job_state_best_effort(
                 &data.redis_pool,
                 &data.job_state_prefix,
                 JobStateRecord {
@@ -221,9 +276,9 @@ async fn handle_job(job: QueuedJob, data: Data<WorkerContext>) -> Result<(), std
                     terminal_reason: Some(classify_failure_reason(&source).to_string()),
                     queue_wait_ms: Some(queue_wait_ms),
                 },
+                "job execution failure",
             )
-            .await?;
-            return Err(source);
+            .await;
         }
     }
 
@@ -339,7 +394,7 @@ async fn record_interrupted_job(
 ) -> Result<(), std::io::Error> {
     data.jobs_failed.fetch_add(1, Ordering::Relaxed);
     saturating_decrement(&data.jobs_in_flight);
-    write_job_state(
+    persist_job_state_best_effort(
         &data.redis_pool,
         &data.job_state_prefix,
         JobStateRecord {
@@ -352,13 +407,11 @@ async fn record_interrupted_job(
             terminal_reason: Some("interrupted_by_admin".to_string()),
             queue_wait_ms: Some(queue_wait_ms),
         },
+        "admin interrupt",
     )
-    .await?;
+    .await;
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Interrupted,
-        "interrupted by admin request",
-    ))
+    Ok(())
 }
 
 async fn cleanup_workspace(
@@ -494,12 +547,103 @@ fn has_testcase_stage_status(result: &JobResult, status: StageStatus) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use jet_core::models::{JobResult, StageResult, StageStatus, TestcaseResult};
+    use apalis::prelude::Data;
+    use deadpool_redis::{Config as PoolConfig, Runtime as PoolRuntime, redis::AsyncCommands};
+    use jet_core::models::{FileRequest, JobRequest, JobResult, StageResult, StageStatus, TestcaseResult};
+    use mini_redis::server;
+    use tempfile::tempdir;
+    use tokio::{net::TcpListener, sync::oneshot};
 
-    use super::{classify_failure_reason, normalize_arch};
+    use super::{
+        WorkerContext, classify_failure_reason, handle_job, job_state_key, normalize_arch,
+    };
+    use crate::queue::{JobStateRecord, JobType, QueuedJob};
+
     use crate::counters::saturating_decrement;
+
+    async fn start_test_redis() -> (String, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test redis listener");
+        let addr = listener.local_addr().expect("local addr");
+        let redis_url = format!("redis://{}/", addr);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = server::run(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        (redis_url, shutdown_tx)
+    }
+
+    fn sample_job(job_id: &str) -> QueuedJob {
+        QueuedJob {
+            id: job_id.to_string(),
+            language: "java".to_string(),
+            version: "17.0.0".to_string(),
+            request: JobRequest {
+                job_id: Some(job_id.to_string()),
+                language: "java".to_string(),
+                version: Some("17.0.0".to_string()),
+                files: vec![FileRequest {
+                    name: Some("Main.java".to_string()),
+                    content: "class Main { public static void main(String[] args) { System.out.println(\"Hello\") } }".to_string(),
+                    encoding: None,
+                }],
+                testcases: None,
+                args: None,
+                stdin: None,
+                run_timeout: None,
+                compile_timeout: None,
+                run_memory_limit: None,
+                compile_memory_limit: None,
+                run_output_limit: None,
+                compile_output_limit: None,
+            },
+            enqueued_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            job_type: JobType::Compile,
+        }
+    }
+
+    fn sample_context(
+        redis_pool: deadpool_redis::Pool,
+        runtime_install_dir: PathBuf,
+        jobs_failed: Arc<AtomicU64>,
+        jobs_in_flight: Arc<AtomicU64>,
+        interrupt_requested: Arc<AtomicBool>,
+    ) -> WorkerContext {
+        WorkerContext {
+            manifests: Arc::new(HashMap::new()),
+            runtime_install_dir,
+            redis_pool,
+            job_state_prefix: "jet:jobs".to_string(),
+            jobs_completed: Arc::new(AtomicU64::new(0)),
+            jobs_failed,
+            jobs_in_flight,
+            compile_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            execute_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            compile_in_flight: Arc::new(AtomicU64::new(0)),
+            execute_in_flight: Arc::new(AtomicU64::new(0)),
+            interrupt_requested,
+            max_queue_wait_ms: 30_000,
+        }
+    }
 
     #[test]
     fn normalizes_common_arch_aliases() {
@@ -575,6 +719,86 @@ mod tests {
         assert_eq!(super::terminal_reason_from_result(&result), "run_timeout");
     }
 
+    #[tokio::test]
+    async fn process_error_terminalizes_job_without_requeue_error() {
+        let (redis_url, shutdown_tx) = start_test_redis().await;
+        let pool_cfg = PoolConfig::from_url(&redis_url);
+        let redis_pool = pool_cfg
+            .create_pool(Some(PoolRuntime::Tokio1))
+            .expect("create redis pool");
+
+        let tmp = tempdir().expect("tempdir");
+        let jobs_failed = Arc::new(AtomicU64::new(0));
+        let jobs_in_flight = Arc::new(AtomicU64::new(1));
+        let interrupt_requested = Arc::new(AtomicBool::new(false));
+        let context = sample_context(
+            redis_pool.clone(),
+            tmp.path().to_path_buf(),
+            jobs_failed.clone(),
+            jobs_in_flight.clone(),
+            interrupt_requested,
+        );
+
+        let job = sample_job("job-process-fail");
+        let result = handle_job(job.clone(), Data::new(context)).await;
+        assert!(result.is_ok(), "terminalized failures should be ACKed");
+        assert_eq!(jobs_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(jobs_in_flight.load(Ordering::Relaxed), 0);
+
+        let mut conn = redis_pool.get().await.expect("pool connection");
+        let raw: String = conn
+            .get(job_state_key("jet:jobs", &job.id))
+            .await
+            .expect("fetch job state");
+        let state: JobStateRecord = serde_json::from_str(&raw).expect("decode state");
+        assert_eq!(state.status, "failed");
+        assert_eq!(state.terminal_reason.as_deref(), Some("execution_error"));
+        assert!(
+            state.error.unwrap_or_default().contains("manifest missing"),
+            "expected manifest-missing infra error to be surfaced"
+        );
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn interrupt_terminalizes_job_without_requeue_error() {
+        let (redis_url, shutdown_tx) = start_test_redis().await;
+        let pool_cfg = PoolConfig::from_url(&redis_url);
+        let redis_pool = pool_cfg
+            .create_pool(Some(PoolRuntime::Tokio1))
+            .expect("create redis pool");
+
+        let tmp = tempdir().expect("tempdir");
+        let jobs_failed = Arc::new(AtomicU64::new(0));
+        let jobs_in_flight = Arc::new(AtomicU64::new(1));
+        let interrupt_requested = Arc::new(AtomicBool::new(true));
+        let context = sample_context(
+            redis_pool.clone(),
+            tmp.path().to_path_buf(),
+            jobs_failed.clone(),
+            jobs_in_flight.clone(),
+            interrupt_requested,
+        );
+
+        let job = sample_job("job-interrupt");
+        let result = handle_job(job.clone(), Data::new(context)).await;
+        assert!(result.is_ok(), "interrupted jobs should be ACKed");
+        assert_eq!(jobs_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(jobs_in_flight.load(Ordering::Relaxed), 0);
+
+        let mut conn = redis_pool.get().await.expect("pool connection");
+        let raw: String = conn
+            .get(job_state_key("jet:jobs", &job.id))
+            .await
+            .expect("fetch job state");
+        let state: JobStateRecord = serde_json::from_str(&raw).expect("decode state");
+        assert_eq!(state.status, "failed");
+        assert_eq!(state.terminal_reason.as_deref(), Some("interrupted_by_admin"));
+
+        let _ = shutdown_tx.send(());
+    }
+
     fn stage(status: StageStatus) -> StageResult {
         StageResult {
             status,
@@ -618,4 +842,23 @@ async fn write_job_state(
             .map_err(|source| std::io::Error::other(source.to_string()))?;
     }
     Ok(())
+}
+
+async fn persist_job_state_best_effort(
+    pool: &Pool,
+    prefix: &str,
+    state: JobStateRecord,
+    phase: &str,
+) {
+    let job_id = state.job_id.clone();
+    let status = state.status.clone();
+    if let Err(source) = write_job_state(pool, prefix, state).await {
+        warn!(
+            job_id = %job_id,
+            status = %status,
+            phase = phase,
+            error = %source,
+            "failed to persist job state"
+        );
+    }
 }
